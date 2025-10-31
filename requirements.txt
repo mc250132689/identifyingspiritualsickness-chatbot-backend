@@ -3,4 +3,3 @@ uvicorn
 huggingface_hub
 langdetect
 requests
-difflib
