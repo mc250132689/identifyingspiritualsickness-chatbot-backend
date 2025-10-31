@@ -1,89 +1,86 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langdetect import detect
-import re
+import json
+import os
 
 app = FastAPI()
 
-origins = ["*"]
-
+# CORS setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# === Simple dataset for now ===
-knowledge_base = {
-    "en": {
-        "sihir": "According to Islamic teachings, sihir (black magic) is real and can affect people. Recite Surah Al-Baqarah, Ayat Kursi, and perform ruqyah regularly.",
-        "jinn": "Jinn can cause disturbances, but Allah gives protection through dhikr, dua, and reciting Surah Al-Falaq and An-Naas.",
-        "ruqyah": "Ruqyah should be done using Quranic verses and authentic duas — avoid any form of shirk or amulets.",
-        "spiritual": "Spiritual sickness refers to diseases of the heart, such as envy, pride, or doubt — purified through repentance and remembrance of Allah."
-    },
-    "ms": {
-        "sihir": "Menurut ajaran Islam, sihir itu wujud dan boleh mempengaruhi manusia. Bacalah Surah Al-Baqarah, Ayat Kursi, dan lakukan ruqyah secara berkala.",
-        "jin": "Jin boleh mengganggu manusia, tetapi Allah memberi perlindungan melalui zikir, doa, serta bacaan Surah Al-Falaq dan An-Naas.",
-        "ruqyah": "Ruqyah dilakukan dengan ayat-ayat Al-Quran dan doa sahih — elakkan tangkal atau jampi yang syirik.",
-        "spiritual": "Penyakit rohani ialah penyakit hati seperti hasad, takabbur, dan ragu-ragu — dirawat dengan taubat dan zikir kepada Allah."
-    },
-    "ar": {
-        "سحر": "السحر حقيقي ويمكن أن يؤثر على الناس. الرقية الشرعية وقراءة سورة البقرة وآية الكرسي تحمي المسلم من الأذى.",
-        "جن": "الجن قد يؤذون الإنسان، لكن الله يحمي من خلال الذكر والدعاء وقراءة سور الفلق والناس.",
-        "رقية": "يجب أن تكون الرقية بالقرآن والأدعية الصحيحة، وتجنب الشرك والتمائم.",
-        "روح": "المرض الروحي يتعلق بأمراض القلب كالحسد والكبر والشك، ويعالج بالتوبة والذكر."
-    }
-}
+DATA_FILE = "training_data.json"
+
+# Initialize training data file if not exists
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f, ensure_ascii=False, indent=2)
 
 
-class Message(BaseModel):
-    text: str
+class ChatRequest(BaseModel):
+    message: str
+
+
+class TrainRequest(BaseModel):
+    question: str
+    answer: str
+
+
+def load_data():
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 @app.post("/chat")
-async def chat(message: Message):
-    text = message.text.strip()
-    try:
-        lang = detect(text)
-    except:
-        lang = "en"
+async def chat(req: ChatRequest):
+    user_message = req.message.strip()
+    lang = detect(user_message)
+    data = load_data()
 
-    if lang.startswith("ms"):
-        lang = "ms"
-    elif lang.startswith("ar"):
-        lang = "ar"
-    else:
-        lang = "en"
+    # Try matching by language
+    for item in data:
+        if item["lang"] == lang and item["question"].lower() in user_message.lower():
+            return {"response": item["answer"]}
 
-    response = None
-    for keyword, reply in knowledge_base.get(lang, {}).items():
-        if re.search(keyword, text, re.IGNORECASE):
-            response = reply
-            break
+    # Default fallback response
+    default_responses = {
+        "en": "I’m sorry, I don’t yet have an Islamic answer for that. Please refer to the Quran, Sunnah, or ruqyah healing practices.",
+        "ms": "Maaf, saya belum mempunyai jawapan Islam untuk itu. Sila rujuk kepada al-Quran, Sunnah, atau rawatan ruqyah.",
+        "ar": "عذرًا، لا أملك إجابة إسلامية لذلك بعد. يرجى الرجوع إلى القرآن والسنة والرقية الشرعية.",
+    }
 
-    if not response:
-        if lang == "ms":
-            response = "Maaf, saya hanya dapat menjawab berdasarkan rawatan Islam, ruqyah, sihir, dan gangguan jin."
-        elif lang == "ar":
-            response = "عذرًا، أستطيع الإجابة فقط بناءً على الرقية والسحر والجن والأمراض الروحية."
-        else:
-            response = "Sorry, I can only answer based on Islamic healing, ruqyah, sihir, and jinn-related issues."
-
-    return {"response": response}
+    return {"response": default_responses.get(lang, default_responses["en"])}
 
 
 @app.post("/train")
-async def train(request: Request):
-    data = await request.json()
-    question = data.get("question")
-    answer = data.get("answer")
-    lang = data.get("lang", "en")
+async def train(req: TrainRequest):
+    question = req.question.strip()
+    answer = req.answer.strip()
+    lang = detect(question)
 
-    if lang not in knowledge_base:
-        knowledge_base[lang] = {}
+    if not question or not answer:
+        return {"message": "Please provide both question and answer."}
 
-    knowledge_base[lang][question.lower()] = answer
-    return {"message": f"Training added successfully for {lang}!"}
+    data = load_data()
+
+    # Update if similar question already exists in same language
+    for item in data:
+        if item["lang"] == lang and item["question"].lower() == question.lower():
+            item["answer"] = answer
+            save_data(data)
+            return {"message": f"Updated existing {lang.upper()} training data."}
+
+    data.append({"question": question, "answer": answer, "lang": lang})
+    save_data(data)
+    return {"message": f"Added new {lang.upper()} training data successfully."}
