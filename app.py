@@ -27,23 +27,31 @@ if not os.path.exists(DATA_FILE):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump({"training_data": []}, f, ensure_ascii=False, indent=2)
 
-# === Models ===
-class ChatRequest(BaseModel):
-    message: str
+# === In-memory training dictionary ===
+# Structure: trained_answers[lang][question_lower] = answer
+trained_answers = {}
 
-
-class TrainRequest(BaseModel):
-    question: str
-    answer: str
-
-# === Utility functions ===
 def load_data():
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)["training_data"]
+        data_list = json.load(f)["training_data"]
+    # Populate in-memory dictionary
+    global trained_answers
+    trained_answers = {}
+    for item in data_list:
+        lang = item["lang"]
+        q = item["question"].lower()
+        a = item["answer"]
+        if lang not in trained_answers:
+            trained_answers[lang] = {}
+        trained_answers[lang][q] = a
+    return data_list
 
 def save_data(data_list):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump({"training_data": data_list}, f, ensure_ascii=False, indent=2)
+
+# Initial load
+load_data()
 
 def translate(text, source, target):
     """Translate text using Hugging Face translation models"""
@@ -70,37 +78,35 @@ def translate(text, source, target):
     except Exception:
         return text
 
-# === Chat endpoint (updated to log all user messages) ===
+# === Request models ===
+class ChatRequest(BaseModel):
+    message: str
+
+class TrainRequest(BaseModel):
+    question: str
+    answer: str
+
+# === Chat endpoint ===
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_message = req.message.strip()
     if not user_message:
         return {"response": "Please type a message."}
 
-    # Detect language
     try:
         lang = detect(user_message)
     except Exception:
         lang = "en"
 
-    # Load training data
-    data = load_data()
+    # 1️⃣ Check in-memory trained answers first
+    lang_dict = trained_answers.get(lang, {})
+    match = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
+    if match:
+        answer = lang_dict[match[0]]
+        return {"response": answer}
 
-    # 1️⃣ Check training data for close matches in the same language
-    questions_in_lang = [item["question"] for item in data if item["lang"] == lang]
-    if questions_in_lang:
-        match = difflib.get_close_matches(user_message, questions_in_lang, n=1, cutoff=0.6)
-        if match:
-            for item in data:
-                if item["lang"] == lang and item["question"] == match[0]:
-                    # Log the message even if answer exists
-                    data.append({"question": user_message, "answer": item["answer"], "lang": lang})
-                    save_data(data)
-                    return {"response": item["answer"]}
-
-    # 2️⃣ No match → ask GPT-OSS
+    # 2️⃣ No match → query GPT-OSS via Hugging Face InferenceClient
     eng_msg = user_message if lang == "en" else translate(user_message, lang, "en")
-
     completion = client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=[
@@ -115,15 +121,19 @@ async def chat(req: ChatRequest):
             {"role": "user", "content": eng_msg},
         ],
     )
-
     reply = completion.choices[0].message["content"]
 
+    # Translate back if needed
     if lang != "en":
         reply = translate(reply, "en", lang)
 
-    # ✅ Log every user message for later review
+    # Save to JSON and in-memory
+    data = load_data()
     data.append({"question": user_message, "answer": reply, "lang": lang})
     save_data(data)
+    if lang not in trained_answers:
+        trained_answers[lang] = {}
+    trained_answers[lang][user_message.lower()] = reply
 
     return {"response": reply}
 
@@ -142,20 +152,25 @@ async def train(req: TrainRequest):
 
     data = load_data()
     # Update existing if duplicate
+    updated = False
     for item in data:
         if item["lang"] == lang and item["question"].lower() == question.lower():
             item["answer"] = answer
-            save_data(data)
-            return {"message": f"Updated existing {lang.upper()} training data."}
-
-    # Add new
-    data.append({"question": question, "answer": answer, "lang": lang})
+            updated = True
+            break
+    if not updated:
+        data.append({"question": question, "answer": answer, "lang": lang})
     save_data(data)
-    return {"message": f"Added new {lang.upper()} training data successfully."}
+
+    # Update in-memory trained_answers instantly
+    if lang not in trained_answers:
+        trained_answers[lang] = {}
+    trained_answers[lang][question.lower()] = answer
+
+    return {"message": f"{'Updated' if updated else 'Added'} {lang.upper()} training data successfully."}
 
 # === Get all training data ===
 @app.get("/get-training-data")
 async def get_training_data():
     data = load_data()
     return {"training_data": data}
-
