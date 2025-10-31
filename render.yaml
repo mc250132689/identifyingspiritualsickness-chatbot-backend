@@ -1,0 +1,5 @@
+services:
+  - type: web
+    name: spiritual-sickness-backend
+    env: docker
+    plan: free
