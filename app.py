@@ -70,30 +70,35 @@ def translate(text, source, target):
     except Exception:
         return text
 
-# === Chat endpoint ===
+# === Chat endpoint (updated to log all user messages) ===
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_message = req.message.strip()
     if not user_message:
         return {"response": "Please type a message."}
 
+    # Detect language
     try:
         lang = detect(user_message)
     except Exception:
         lang = "en"
 
+    # Load training data
     data = load_data()
 
-    # 1️⃣ Check training data for close matches in same language
+    # 1️⃣ Check training data for close matches in the same language
     questions_in_lang = [item["question"] for item in data if item["lang"] == lang]
     if questions_in_lang:
         match = difflib.get_close_matches(user_message, questions_in_lang, n=1, cutoff=0.6)
         if match:
             for item in data:
                 if item["lang"] == lang and item["question"] == match[0]:
+                    # Log the message even if answer exists
+                    data.append({"question": user_message, "answer": item["answer"], "lang": lang})
+                    save_data(data)
                     return {"response": item["answer"]}
 
-    # 2️⃣ If not found, ask GPT-OSS model
+    # 2️⃣ No match → ask GPT-OSS
     eng_msg = user_message if lang == "en" else translate(user_message, lang, "en")
 
     completion = client.chat.completions.create(
@@ -102,8 +107,8 @@ async def chat(req: ChatRequest):
             {
                 "role": "system",
                 "content": (
-                    "You are an Islamic assistant specializing in identifying spiritual sickness, sihr, jinn disturbances, "
-                    "and providing guidance according to Quran, Sunnah, and authentic ruqyah. "
+                    "You are an Islamic assistant specializing in identifying spiritual sickness, "
+                    "sihr, jinn disturbances, and providing guidance according to Quran, Sunnah, and authentic ruqyah. "
                     "Keep your answers strictly Islamic and practical."
                 ),
             },
@@ -115,6 +120,10 @@ async def chat(req: ChatRequest):
 
     if lang != "en":
         reply = translate(reply, "en", lang)
+
+    # ✅ Log every user message for later review
+    data.append({"question": user_message, "answer": reply, "lang": lang})
+    save_data(data)
 
     return {"response": reply}
 
