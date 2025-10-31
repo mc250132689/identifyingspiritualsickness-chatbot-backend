@@ -153,8 +153,9 @@ async def train(req: TrainRequest):
     save_data(data)
     return {"message": f"Added new {lang.upper()} training data successfully."}
 
-# === Training data ===
-@app.get("/training-data")
+# === Get all training data ===
+@app.get("/get-training-data")
 async def get_training_data():
     data = load_data()
     return {"training_data": data}
+
