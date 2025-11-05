@@ -128,22 +128,20 @@ async def chat(req: ChatRequest):
     except Exception:
         lang = "en"
 
-symptoms_found = detect_spiritual_symptoms(user_message)
+    symptoms_found = detect_spiritual_symptoms(user_message)
 
-if symptoms_found:
-    return {"response":
-        "🕌 *Possible Spiritual Disturbance Noticed*\n\n"
-        "Based on your symptoms:\n- " + "\n- ".join(symptoms_found) +
-        "\n\nRecommended actions:\n"
-        "1. Perform Surah Al-Baqarah daily\n"
-        "2. Recite Ayat al-Kursi before sleeping\n"
-        "3. Play Ruqyah audio (Mishary Rashid)\n"
-        "4. Avoid sin, maintain wudu, reduce stress\n\n"
-        "If symptoms intensify, refer to a **qualified ruqyah practitioner**."
-    }
+    if symptoms_found:
+        return {"response":
+            "🕌 *Possible Spiritual Disturbance Noticed*\n\n"
+            "Based on your symptoms:\n- " + "\n- ".join(symptoms_found) +
+            "\n\nRecommended actions:\n"
+            "1. Perform Surah Al-Baqarah daily\n"
+            "2. Recite Ayat al-Kursi before sleeping\n"
+            "3. Play Ruqyah audio (Mishary Rashid)\n"
+            "4. Avoid sin, maintain wudu, reduce stress\n\n"
+            "If symptoms intensify, refer to a **qualified ruqyah practitioner**."
+        }
 
-    
-    
     # 1️⃣ Check in-memory trained answers first
     lang_dict = trained_answers.get(lang, {})
     match = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
@@ -177,8 +175,10 @@ if symptoms_found:
     data = load_data()
     data.append({"question": user_message, "answer": reply, "lang": lang})
     save_data(data)
+
     if lang not in trained_answers:
         trained_answers[lang] = {}
+
     trained_answers[lang][user_message.lower()] = reply
 
     return {"response": reply}
