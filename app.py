@@ -102,6 +102,20 @@ class TrainRequest(BaseModel):
     question: str
     answer: str
 
+def detect_spiritual_symptoms(text):
+    text_lower = text.lower()
+    symptoms = {
+        "nightmares": "Frequent nightmares",
+        "hearing whispers": "Hearing whispers",
+        "sleep paralysis": "Sleep paralysis",
+        "sudden anger": "Sudden intense anger",
+        "fear of Quran": "Discomfort when hearing Quran",
+        "pressure on chest": "Chest tightness when sleeping"
+    }
+    detected = [sym for key, sym in symptoms.items() if key in text_lower]
+    return detected
+
+
 # === Chat endpoint ===
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -114,6 +128,22 @@ async def chat(req: ChatRequest):
     except Exception:
         lang = "en"
 
+symptoms_found = detect_spiritual_symptoms(user_message)
+
+if symptoms_found:
+    return {"response":
+        "🕌 *Possible Spiritual Disturbance Noticed*\n\n"
+        "Based on your symptoms:\n- " + "\n- ".join(symptoms_found) +
+        "\n\nRecommended actions:\n"
+        "1. Perform Surah Al-Baqarah daily\n"
+        "2. Recite Ayat al-Kursi before sleeping\n"
+        "3. Play Ruqyah audio (Mishary Rashid)\n"
+        "4. Avoid sin, maintain wudu, reduce stress\n\n"
+        "If symptoms intensify, refer to a **qualified ruqyah practitioner**."
+    }
+
+    
+    
     # 1️⃣ Check in-memory trained answers first
     lang_dict = trained_answers.get(lang, {})
     match = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
@@ -158,38 +188,41 @@ async def chat(req: ChatRequest):
 async def train(req: TrainRequest):
     question = req.question.strip()
     answer = req.answer.strip()
-    if not question or not answer:
-        return {"message": "Please provide both question and answer."}
 
     try:
         lang = detect(question)
-    except Exception:
+    except:
         lang = "en"
 
-    data = load_data()
-    # Update existing if duplicate
-    updated = False
-    for item in data:
-        if item["lang"] == lang and item["question"].lower() == question.lower():
-            item["answer"] = answer
-            updated = True
-            break
-    if not updated:
-        data.append({"question": question, "answer": answer, "lang": lang})
-    save_data(data)
+    db = SessionLocal()
 
-    # Update in-memory trained_answers instantly
-    if lang not in trained_answers:
-        trained_answers[lang] = {}
-    trained_answers[lang][question.lower()] = answer
+    existing = db.query(TrainingData).filter(
+        TrainingData.question.ilike(question), TrainingData.lang == lang
+    ).first()
 
-    return {"message": f"{'Updated' if updated else 'Added'} {lang.upper()} training data successfully."}
+    if existing:
+        existing.answer = answer
+        msg = "Updated existing response."
+    else:
+        new_entry = TrainingData(question=question, answer=answer, lang=lang)
+        db.add(new_entry)
+        msg = "Added new response."
+
+    db.commit()
+    db.close()
+
+    load_data()
+    return {"message": msg}
 
 # === Get all training data ===
 @app.get("/get-training-data")
 async def get_training_data():
     data = load_data()
-    return {"training_data": data}
+    return {"training_data": [
+        {"question": d.question, "answer": d.answer, "lang": d.lang}
+        for d in data
+    ]}
+
 
 # === Admin analytics ===
 ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
