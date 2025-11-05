@@ -52,23 +52,19 @@ if not os.path.exists(DATA_FILE):
 trained_answers = {}
 
 def load_data():
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data_list = json.load(f)["training_data"]
-    # Populate in-memory dictionary
+    db = SessionLocal()
+    data_list = db.query(TrainingData).all()
+    db.close()
+
     global trained_answers
     trained_answers = {}
-    for item in data_list:
-        lang = item["lang"]
-        q = item["question"].lower()
-        a = item["answer"]
-        if lang not in trained_answers:
-            trained_answers[lang] = {}
-        trained_answers[lang][q] = a
-    return data_list
 
-def save_data(data_list):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump({"training_data": data_list}, f, ensure_ascii=False, indent=2)
+    for item in data_list:
+        if item.lang not in trained_answers:
+            trained_answers[item.lang] = {}
+        trained_answers[item.lang][item.question.lower()] = item.answer
+
+    return data_list
 
 # Initial load
 load_data()
