@@ -7,6 +7,8 @@ import difflib
 import json
 import os
 import requests
+from collections import Counter
+from fastapi import Query
 
 # === FastAPI setup ===
 app = FastAPI()
@@ -174,3 +176,28 @@ async def train(req: TrainRequest):
 async def get_training_data():
     data = load_data()
     return {"training_data": data}
+
+# === Admin analytics ===
+ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
+
+@app.get("/admin-stats")
+async def admin_stats(key: str = Query(...)):
+    """Return simple analytics if admin key is correct"""
+    if key != ADMIN_KEY:
+        return {"error": "Unauthorized"}
+
+    data = load_data()
+    total_records = len(data)
+    lang_count = Counter(item.get("lang", "unknown") for item in data)
+    
+    # Compute average answer length & question length
+    avg_q_len = round(sum(len(item["question"]) for item in data) / total_records, 1) if total_records else 0
+    avg_a_len = round(sum(len(item["answer"]) for item in data) / total_records, 1) if total_records else 0
+
+    return {
+        "total_records": total_records,
+        "languages": dict(lang_count),
+        "avg_question_length": avg_q_len,
+        "avg_answer_length": avg_a_len
+    }
+
