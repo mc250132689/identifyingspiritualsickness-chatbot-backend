@@ -3,3 +3,5 @@ uvicorn
 huggingface_hub
 langdetect
 requests
+psycopg2
+SQLAlchemy
