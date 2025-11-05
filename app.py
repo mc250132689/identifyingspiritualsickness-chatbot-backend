@@ -6,16 +6,16 @@ from langdetect import detect
 import difflib
 import os
 import requests
-from collections import Counter
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base
+from collections import Counter
 
-# === Database setup ===
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
+# === Database model ===
 class TrainingData(Base):
     __tablename__ = "training_data"
     id = Column(Integer, primary_key=True, index=True)
@@ -38,36 +38,25 @@ app.add_middleware(
 HF_TOKEN = os.getenv("HF_TOKEN")
 client = InferenceClient(provider="groq", api_key=HF_TOKEN)
 
-# === In-memory training dictionary ===
-trained_answers = {}  # Structure: trained_answers[lang][question_lower] = answer
+# === In-memory trained Q&A ===
+trained_answers = {}
 
 def load_data():
-    """Load all training data from DB into in-memory dictionary"""
     db = SessionLocal()
     data_list = db.query(TrainingData).all()
     db.close()
 
     global trained_answers
     trained_answers = {}
+
     for item in data_list:
         if item.lang not in trained_answers:
             trained_answers[item.lang] = {}
         trained_answers[item.lang][item.question.lower()] = item.answer
-
     return data_list
 
-# Initial load
 load_data()
 
-# === Request models ===
-class ChatRequest(BaseModel):
-    message: str
-
-class TrainRequest(BaseModel):
-    question: str
-    answer: str
-
-# === Utilities ===
 def translate(text, source, target):
     """Translate text using Hugging Face translation models"""
     model_map = {
@@ -93,22 +82,29 @@ def translate(text, source, target):
     except Exception:
         return text
 
+# === Request models ===
+class ChatRequest(BaseModel):
+    message: str
+
+class TrainRequest(BaseModel):
+    question: str
+    answer: str
+
+# === Detect spiritual symptoms ===
 def detect_spiritual_symptoms(text):
-    """Check user message for known spiritual symptoms"""
     text_lower = text.lower()
     symptoms = {
         "nightmares": "Frequent nightmares",
         "hearing whispers": "Hearing whispers",
         "sleep paralysis": "Sleep paralysis",
         "sudden anger": "Sudden intense anger",
-        "fear of quran": "Discomfort when hearing Quran",
+        "fear of Quran": "Discomfort when hearing Quran",
         "pressure on chest": "Chest tightness when sleeping"
     }
     detected = [sym for key, sym in symptoms.items() if key in text_lower]
     return detected
 
-# === Endpoints ===
-
+# === Chat endpoint ===
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_message = req.message.strip()
@@ -120,61 +116,63 @@ async def chat(req: ChatRequest):
     except Exception:
         lang = "en"
 
-    # Check spiritual symptoms first
     symptoms_found = detect_spiritual_symptoms(user_message)
+
     if symptoms_found:
         return {"response":
-            "🕌 *Possible Spiritual Disturbance Noticed*\n\n"
-            "Based on your symptoms:\n- " + "\n- ".join(symptoms_found) +
-            "\n\nRecommended actions:\n"
-            "1. Perform Surah Al-Baqarah daily\n"
+            "🕌 *Possible Spiritual Disturbance Detected*\n\n"
+            "Symptoms observed:\n- " + "\n- ".join(symptoms_found) +
+            "\n\nRecommended Islamic actions:\n"
+            "1. Recite Surah Al-Baqarah daily\n"
             "2. Recite Ayat al-Kursi before sleeping\n"
-            "3. Play Ruqyah audio (Mishary Rashid)\n"
-            "4. Avoid sin, maintain wudu, reduce stress\n\n"
-            "If symptoms intensify, refer to a **qualified ruqyah practitioner**."
+            "3. Listen to authentic Ruqyah (Mishary Rashid)\n"
+            "4. Maintain wudu, avoid sin, reduce stress\n\n"
+            "If symptoms intensify, consult a **qualified ruqyah practitioner**."
         }
 
     # 1️⃣ Check in-memory trained answers
     lang_dict = trained_answers.get(lang, {})
     match = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
     if match:
-        return {"response": lang_dict[match[0]]}
+        answer = lang_dict[match[0]]
+        return {"response": answer}
 
-    # 2️⃣ Query GPT-OSS via Hugging Face
+    # 2️⃣ Query GPT-OSS if no trained answer
     eng_msg = user_message if lang == "en" else translate(user_message, lang, "en")
     completion = client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=[
-            {"role": "system", "content": (
-                "You are an Islamic assistant specializing in identifying spiritual sickness, "
-                "sihr, jinn disturbances, and providing guidance according to Quran, Sunnah, and authentic ruqyah. "
-                "Keep your answers strictly Islamic and practical."
-            )},
+            {
+                "role": "system",
+                "content": (
+                    "You are an Islamic assistant specializing in: "
+                    "spiritual sickness, sihr, jinn, black magic, ruqyah, and Islamic medical practices. "
+                    "Only provide guidance strictly based on Quran, Sunnah, authentic ruqyah, and Islamic knowledge. "
+                    "Do not give secular psychology or non-Islamic advice."
+                ),
+            },
             {"role": "user", "content": eng_msg},
-        ]
+        ],
     )
     reply = completion.choices[0].message["content"]
 
     if lang != "en":
         reply = translate(reply, "en", lang)
 
-    # Save to DB and update in-memory dict
+    # Save to DB & in-memory
     db = SessionLocal()
-    existing = db.query(TrainingData).filter(
-        TrainingData.question.ilike(user_message),
-        TrainingData.lang == lang
-    ).first()
-    if existing:
-        existing.answer = reply
-    else:
-        db.add(TrainingData(question=user_message, answer=reply, lang=lang))
+    new_entry = TrainingData(question=user_message, answer=reply, lang=lang)
+    db.add(new_entry)
     db.commit()
     db.close()
 
-    load_data()  # refresh in-memory dict
+    if lang not in trained_answers:
+        trained_answers[lang] = {}
+    trained_answers[lang][user_message.lower()] = reply
 
     return {"response": reply}
 
+# === Train endpoint ===
 @app.post("/train")
 async def train(req: TrainRequest):
     question = req.question.strip()
@@ -182,36 +180,38 @@ async def train(req: TrainRequest):
 
     try:
         lang = detect(question)
-    except Exception:
+    except:
         lang = "en"
 
     db = SessionLocal()
     existing = db.query(TrainingData).filter(
-        TrainingData.question.ilike(question),
-        TrainingData.lang == lang
+        TrainingData.question.ilike(question), TrainingData.lang == lang
     ).first()
+
     if existing:
         existing.answer = answer
         msg = "Updated existing response."
     else:
-        db.add(TrainingData(question=question, answer=answer, lang=lang))
+        new_entry = TrainingData(question=question, answer=answer, lang=lang)
+        db.add(new_entry)
         msg = "Added new response."
+
     db.commit()
     db.close()
-
-    load_data()  # refresh in-memory dict
+    load_data()
     return {"message": msg}
 
+# === Get all training data ===
 @app.get("/get-training-data")
 async def get_training_data():
     data = load_data()
     return {"training_data": [
-        {"question": d.question, "answer": d.answer, "lang": d.lang} for d in data
+        {"question": d.question, "answer": d.answer, "lang": d.lang}
+        for d in data
     ]}
 
 # === Admin analytics ===
 ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
-
 @app.get("/admin-stats")
 async def admin_stats(key: str = Query(...)):
     if key != ADMIN_KEY:
@@ -219,9 +219,9 @@ async def admin_stats(key: str = Query(...)):
 
     data = load_data()
     total_records = len(data)
-    lang_count = Counter(item.lang for item in data)
-    avg_q_len = round(sum(len(item.question) for item in data)/total_records,1) if total_records else 0
-    avg_a_len = round(sum(len(item.answer) for item in data)/total_records,1) if total_records else 0
+    lang_count = Counter(item.get("lang", "unknown") for item in data)
+    avg_q_len = round(sum(len(item["question"]) for item in data) / total_records, 1) if total_records else 0
+    avg_a_len = round(sum(len(item["answer"]) for item in data) / total_records, 1) if total_records else 0
 
     return {
         "total_records": total_records,
