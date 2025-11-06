@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+huggingface-hub
+langdetect
+difflib3
