@@ -1,6 +1,6 @@
-fastapi
-uvicorn[standard]
-pydantic
-huggingface-hub
-langdetect
-difflib3
+fastapi==0.111.2
+uvicorn[standard]==0.23.2
+pydantic==2.6.1
+huggingface-hub==0.18.1
+langdetect==1.0.9
+difflib3==0.0.1
