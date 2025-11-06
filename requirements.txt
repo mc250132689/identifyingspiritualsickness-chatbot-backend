@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-huggingface_hub
-langdetect
-requests
-psycopg2-binary
-SQLAlchemy
+fastapi>=0.95
+uvicorn[standard]>=0.22
+sqlalchemy>=1.4
+asyncpg>=0.27
+huggingface_hub>=0.16.4
+langdetect>=1.0.9
+python-dotenv>=1.0.0
