@@ -9,24 +9,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langdetect import detect
 
-from sqlalchemy import (
-    Column, Integer, String, Text, DateTime, func, select, text
-)
+from sqlalchemy import Column, Integer, String, Text, DateTime, func, select, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ---------------- CONFIG ----------------
-# Default: use local SQLite for easy run-from-github
 DEFAULT_SQLITE = "sqlite+aiosqlite:///./training.db"
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_SQLITE).strip()
 ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
-HF_TOKEN = os.getenv("HF_TOKEN")  # optional; not required
+HF_TOKEN = os.getenv("HF_TOKEN")  # optional
 
-# If user provided a postgres-like URL without +asyncpg, try to auto-fix
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-# Create async engine
 engine = create_async_engine(DATABASE_URL, echo=False, future=True)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
@@ -77,18 +72,13 @@ class FeedbackRequest(BaseModel):
     text: str
 
 # ---------------- In-memory cache ----------------
-trained_answers = {}  # {lang: {question_lower: answer}}
+trained_answers = {}
 
-# ---------------- Islamic rules ----------------
+# ---------------- Islamic rules & symptoms ----------------
 ISLAMIC_RULES = """
 You are an Islamic assistant specializing in:
-- Spiritual sickness (jinn disturbance, sihr/black magic, evil eye)
-- Islamic medical practices & ruqyah from Qur'an & Sunnah
-
-RULES:
-1. Follow Quran and authentic Sunnah.
-2. Do NOT recommend non-Islamic spiritual methods (crystals, tarot, reiki, chakras, astrology).
-3. Use conditional language for suspected possession; recommend qualified ruqyah practitioners when needed.
+- Spiritual sickness (jinn, sihr/black magic, evil eye)
+- Ruqyah and Islamic medical practices
 """
 
 SYMPTOM_KEYWORDS = {
@@ -117,54 +107,24 @@ async def load_memory_from_db(session: AsyncSession):
         trained_answers.setdefault(lang, {})[r.question.lower()] = r.answer
 
 async def ensure_columns(session: AsyncSession):
-    """
-    Try to add created_at / lang columns if missing.
-    This uses raw SQL and ignores errors (safe for existing columns).
-    """
-    # Add created_at to training_data
     try:
-        # For Postgres: ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...
         await session.execute(text("ALTER TABLE training_data ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
-    except Exception:
-        # SQLite may not support IF NOT EXISTS for columns; try simpler ALTER and ignore failures
-        try:
-            await session.execute(text("ALTER TABLE training_data ADD COLUMN created_at TIMESTAMP"))
-        except Exception:
-            pass
-
-    # chat_logs created_at and lang
+    except: pass
     try:
         await session.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
-    except Exception:
-        try:
-            await session.execute(text("ALTER TABLE chat_logs ADD COLUMN created_at TIMESTAMP"))
-        except Exception:
-            pass
+    except: pass
     try:
         await session.execute(text("ALTER TABLE chat_logs ADD COLUMN IF NOT EXISTS lang VARCHAR(16)"))
-    except Exception:
-        try:
-            await session.execute(text("ALTER TABLE chat_logs ADD COLUMN lang VARCHAR(16)"))
-        except Exception:
-            pass
-
-    # feedback created_at
+    except: pass
     try:
         await session.execute(text("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
-    except Exception:
-        try:
-            await session.execute(text("ALTER TABLE feedback ADD COLUMN created_at TIMESTAMP"))
-        except Exception:
-            pass
+    except: pass
 
 # ---------------- Startup ----------------
 @app.on_event("startup")
 async def startup():
-    # Create tables if not exist
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-    # Try to add missing columns (safe)
     async with AsyncSessionLocal() as s:
         await ensure_columns(s)
         await load_memory_from_db(s)
@@ -179,25 +139,22 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
     user_message = (req.message or "").strip()
     if not user_message:
         raise HTTPException(status_code=400, detail="Please type a message.")
-
     try:
         lang = detect(user_message)
-    except Exception:
+    except:
         lang = "en"
 
     lower = user_message.lower()
 
-    # Block non-Islamic spiritual modalities
     forbidden = ["crystal", "crystals", "tarot", "reiki", "chakra", "chakras", "zodiac", "astrology"]
     for t in forbidden:
         if t in lower:
-            reply = ("I cannot advise on non-Islamic spiritual practices such as crystals, tarot, reiki, chakras or astrology. "
+            reply = ("I cannot advise on non-Islamic spiritual practices. "
                      "This assistant provides Islamic guidance based on Quran, Sunnah, ruqyah, and qualified practitioners.")
             db.add(ChatLog(user_message=user_message, bot_response=reply, lang=lang))
             await db.commit()
             return {"response": reply}
 
-    # Symptom quick-check
     symptoms = [label for k, label in SYMPTOM_KEYWORDS.items() if k in lower]
     if symptoms:
         formatted = "\n- ".join(symptoms)
@@ -214,7 +171,6 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
         await db.commit()
         return {"response": reply}
 
-    # Check trained answers (fuzzy)
     lang_dict = trained_answers.get(lang, {})
     if lang_dict:
         close = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
@@ -224,12 +180,7 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
             await db.commit()
             return {"response": reply}
 
-    # Generative fall-back (disabled if no HF_TOKEN)
-    reply = ("Model not configured on server. Please train this question via the admin Train page, "
-             "or set HF_TOKEN in environment to enable generative responses.")
-    # If you set HF integration, you can insert a call here to the HF API.
-
-    # Save learned answer
+    reply = ("Model not configured. Please train this question via the admin Train page.")
     new_item = TrainingData(question=user_message, answer=reply, lang=lang)
     db.add(new_item)
     db.add(ChatLog(user_message=user_message, bot_response=reply, lang=lang))
@@ -265,56 +216,23 @@ async def get_chat_logs(key: Optional[str] = None, db: AsyncSession = Depends(ge
     res = await db.execute(q)
     rows = res.scalars().all()
     out = [{"id": r.id, "user": r.user_message, "bot": r.bot_response, "lang": r.lang, "time": r.created_at.isoformat() if r.created_at else None} for r in rows]
-    return {"logs": out}
+    return {"chat_logs": out}
 
 @app.post("/feedback")
 async def submit_feedback(payload: FeedbackRequest, db: AsyncSession = Depends(get_db)):
-    text = (payload.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Feedback cannot be empty")
-    fb = Feedback(text=text)
+    if not payload.text.strip():
+        raise HTTPException(status_code=400, detail="Feedback cannot be empty.")
+    fb = Feedback(text=payload.text.strip())
     db.add(fb)
     await db.commit()
-    return {"status": "success", "message": "Feedback submitted"}
+    return {"message": "Thank you for your feedback!"}
 
-@app.get("/feedback")
-async def get_feedback(key: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+@app.get("/feedbacks")
+async def get_feedbacks(key: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     if key != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    q = select(Feedback).order_by(Feedback.created_at.desc()).limit(2000)
+    q = select(Feedback).order_by(Feedback.created_at.desc())
     res = await db.execute(q)
     rows = res.scalars().all()
-    out = [{"id": r.id, "text": r.text, "time": r.created_at.isoformat() if r.created_at else None} for r in rows]
-    return {"feedback": out}
-
-@app.delete("/delete-entry")
-async def delete_entry(question: str, key: str, db: AsyncSession = Depends(get_db)):
-    if key != ADMIN_KEY:
-        return {"error": "Unauthorized"}
-    # case-insensitive match
-    q = select(TrainingData).where(func.lower(TrainingData.question) == question.lower())
-    res = await db.execute(q)
-    item = res.scalars().first()
-    if not item:
-        return {"status": "failed", "message": "Entry not found"}
-    await db.delete(item)
-    await db.commit()
-    await load_memory_from_db(db)
-    return {"status": "success", "message": "Entry deleted"}
-
-@app.put("/update-entry")
-async def update_entry(question: str, new_question: str, new_answer: str, new_lang: str, key: str, db: AsyncSession = Depends(get_db)):
-    if key != ADMIN_KEY:
-        return {"error": "Unauthorized"}
-    q = select(TrainingData).where(func.lower(TrainingData.question) == question.lower())
-    res = await db.execute(q)
-    item = res.scalars().first()
-    if not item:
-        return {"status": "failed", "message": "Entry not found"}
-    item.question = new_question
-    item.answer = new_answer
-    item.lang = new_lang
-    db.add(item)
-    await db.commit()
-    await load_memory_from_db(db)
-    return {"status": "success", "message": "Entry updated"}
+    out = [{"id": r.id, "text": r.text, "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
+    return {"feedbacks": out}
