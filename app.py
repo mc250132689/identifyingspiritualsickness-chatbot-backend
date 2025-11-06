@@ -1,59 +1,69 @@
-from fastapi import FastAPI, Request
+# app.py
+import os
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from huggingface_hub import InferenceClient
 from langdetect import detect
 import difflib
-import json
-import os
+from huggingface_hub import InferenceClient
+
+from sqlalchemy import Column, Integer, String, Text, DateTime, select, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ------------------ CONFIG ------------------
-DATA_FILE = "training_data.json"
+DEFAULT_DB = "postgresql+asyncpg://training_data_pqbq_user:9enoHVmpfOuYplmcRUL7ZN4Lygs5876D@dpg-d45g8om3jp1c73dguc4g-a/training_data_pqbq"
+DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB)
 ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
+HF_TOKEN = os.getenv("HF_TOKEN")  # optional; set to enable HF generative responses
 
-# HuggingFace Model Client (GPT-OSS 20B)
-client = InferenceClient(
-    provider="groq",
-    api_key=os.getenv("HF_TOKEN")
-)
+# HuggingFace Model Client (optional)
+client = None
+if HF_TOKEN:
+    client = InferenceClient(provider="groq", api_key=HF_TOKEN)
 
-app = FastAPI()
+# ------------------ DATABASE SETUP ------------------
+Base = declarative_base()
 
-# Enable CORS for your frontend domain
+class TrainingData(Base):
+    __tablename__ = "training_data"
+    id = Column(Integer, primary_key=True, index=True)
+    question = Column(Text, nullable=False, index=True)
+    answer = Column(Text, nullable=False)
+    lang = Column(String(16), nullable=False, default="en")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ChatLog(Base):
+    __tablename__ = "chat_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    user_message = Column(Text, nullable=False)
+    bot_response = Column(Text, nullable=False)
+    lang = Column(String(16), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id = Column(Integer, primary_key=True, index=True)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+engine = create_async_engine(DATABASE_URL, echo=False, future=True)
+AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+# ------------------ FASTAPI APP ------------------
+app = FastAPI(title="Identifying Spiritual Sickness Chatbot (Backend)")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # You can restrict to your UI domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------ UTILITIES ------------------
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return []
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-trained_answers = {}
-
-def load_memory():
-    data = load_data()
-    for item in data:
-        lang = item.get("lang", "en")
-        q = item["question"].lower()
-        if lang not in trained_answers:
-            trained_answers[lang] = {}
-        trained_answers[lang][q] = item["answer"]
-
-load_memory()
-
-# Islamic Rule Enforcement
 ISLAMIC_RULES = """
 You are an Islamic assistant specializing in:
 - Spiritual sickness (jinn disturbance, sihr/black magic, evil eye)
@@ -68,135 +78,236 @@ RULES YOU MUST FOLLOW:
 6. If user describes severe symptoms → recommend they consult a qualified ruqyah practitioner.
 """
 
-# ------------------ REQUEST MODEL ------------------
-
 class ChatRequest(BaseModel):
     message: str
 
-# ------------------ CHATBOT ENDPOINT ------------------
+class TrainRequest(BaseModel):
+    question: str
+    answer: str
+    lang: Optional[str] = "en"
+
+class FeedbackRequest(BaseModel):
+    text: str
+
+async def init_models():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+trained_answers = {}  # {lang: {question_lower: answer}}
+
+async def load_memory_from_db(session: AsyncSession):
+    trained_answers.clear()
+    q = select(TrainingData)
+    result = await session.execute(q)
+    rows = result.scalars().all()
+    for item in rows:
+        lang = item.lang or "en"
+        trained_answers.setdefault(lang, {})[item.question.lower()] = item.answer
+
+@app.on_event("startup")
+async def startup_event():
+    await init_models()
+    async with AsyncSessionLocal() as session:
+        await load_memory_from_db(session)
+
+SYMPTOM_KEYWORDS = {
+    "nightmare": "Recurring bad dreams",
+    "sleep paralysis": "Sleep paralysis episodes",
+    "shadow": "Seeing black shadows",
+    "jinn": "Possible jinn disturbance",
+    "magic": "Possible sihr / black magic",
+    "sihr": "Signs of sihr (black magic)",
+    "ruqyah": "Seeking ruqyah guidance",
+    "waswas": "Waswas (whispering doubts)"
+}
 
 @app.post("/chat")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
     user_message = req.message.strip()
     if not user_message:
-        return {"response": "Please type a message."}
+        raise HTTPException(status_code=400, detail="Please type a message.")
 
     try:
         lang = detect(user_message)
     except:
         lang = "en"
 
-    # Detect known symptoms
-    symptoms = []
-    symptom_keywords = {
-        "nightmare": "Recurring bad dreams",
-        "sleep paralysis": "Sleep paralysis episodes",
-        "shadow": "Seeing black shadows",
-        "jinn": "Possible jinn disturbance",
-        "magic": "Possible sihr / black magic",
-        "sihr": "Signs of sihr (black magic)",
-        "ruqyah": "Seeking ruqyah guidance",
-        "waswas": "Waswas (whispering doubts)"
-    }
-
-    for key, label in symptom_keywords.items():
-        if key in user_message.lower():
-            symptoms.append(label)
+    lower_msg = user_message.lower()
+    symptoms = [label for key, label in SYMPTOM_KEYWORDS.items() if key in lower_msg]
 
     if symptoms:
         formatted = "\n- ".join(symptoms)
-        return {"response":
-            f"🕌 *Possible Spiritual Symptoms Noticed*\n\n"
+        reply = (
+            "🕌 *Possible Spiritual Symptoms Noticed*\n\n"
             f"You mentioned signs related to:\n- {formatted}\n\n"
-            f"Recommended steps:\n"
-            f"1. Recite Surah Al-Baqarah daily\n"
-            f"2. Recite Ayat al-Kursi before sleep\n"
-            f"3. Play Ruqyah audio (Mishary Rashid / Saad Al-Ghamdi)\n"
-            f"4. Maintain wudu and reduce stress\n\n"
-            f"If symptoms persist or intensify, consult a *qualified ruqyah practitioner*."
-        }
+            "Recommended steps:\n"
+            "1. Recite Surah Al-Baqarah daily\n"
+            "2. Recite Ayat al-Kursi before sleep\n"
+            "3. Play Ruqyah audio (Mishary Rashid / Saad Al-Ghamdi)\n"
+            "4. Maintain wudu and reduce stress\n\n"
+            "If symptoms persist or intensify, consult a *qualified ruqyah practitioner*."
+        )
+        db.add(ChatLog(user_message=user_message, bot_response=reply, lang=lang))
+        await db.commit()
+        return {"response": reply}
 
-    # Check learned answers
     lang_dict = trained_answers.get(lang, {})
-    match = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
-    if match:
-        return {"response": lang_dict[match[0]]}
+    if lang_dict:
+        close = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
+        if close:
+            reply = lang_dict[close[0]]
+            db.add(ChatLog(user_message=user_message, bot_response=reply, lang=lang))
+            await db.commit()
+            return {"response": reply}
 
-    # Generate response using GPT-OSS 20B
-    completion = client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[
-            {"role": "system", "content": ISLAMIC_RULES},
-            {"role": "user", "content": user_message},
-        ],
-    )
+    if client:
+        try:
+            completion = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=[
+                    {"role": "system", "content": ISLAMIC_RULES},
+                    {"role": "user", "content": user_message},
+                ],
+            )
+            reply = completion.choices[0].message["content"]
+        except Exception:
+            reply = "⚠️ Error generating response. Please try again later."
+    else:
+        reply = (
+            "Model not configured on server. Please set HF_TOKEN in environment to enable generative responses, "
+            "or train this question via the admin Train page."
+        )
 
-    reply = completion.choices[0].message["content"]
+    new_item = TrainingData(question=user_message, answer=reply, lang=lang)
+    db.add(new_item)
+    db.add(ChatLog(user_message=user_message, bot_response=reply, lang=lang))
+    await db.commit()
 
-    # Save new learned answer to dataset
-    data = load_data()
-    data.append({"question": user_message, "answer": reply, "lang": lang})
-    save_data(data)
     trained_answers.setdefault(lang, {})[user_message.lower()] = reply
 
     return {"response": reply}
 
-# ------------------ TRAINING VIEW ENDPOINTS ------------------
+@app.post("/train")
+async def train_item(payload: TrainRequest, db: AsyncSession = Depends(get_db)):
+    if not payload.question.strip() or not payload.answer.strip():
+        raise HTTPException(status_code=400, detail="Both question and answer are required.")
+    lang = payload.lang or "en"
+    item = TrainingData(question=payload.question.strip(), answer=payload.answer.strip(), lang=lang)
+    db.add(item)
+    await db.commit()
+    trained_answers.setdefault(lang, {})[payload.question.strip().lower()] = payload.answer.strip()
+    return {"message": "Training data submitted!", "id": item.id}
 
 @app.get("/get-training-data")
-async def get_training_data():
-    return {"training_data": load_data()}
+async def get_training_data(db: AsyncSession = Depends(get_db)):
+    q = select(TrainingData).order_by(TrainingData.created_at.desc())
+    res = await db.execute(q)
+    rows = res.scalars().all()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r.id,
+            "question": r.question,
+            "answer": r.answer,
+            "lang": r.lang,
+            "created_at": r.created_at.isoformat()
+        })
+    return {"training_data": out}
+
+@app.get("/chat-logs")
+async def get_chat_logs(key: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    q = select(ChatLog).order_by(ChatLog.created_at.desc()).limit(5000)
+    res = await db.execute(q)
+    rows = res.scalars().all()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r.id,
+            "user": r.user_message,
+            "bot": r.bot_response,
+            "lang": r.lang,
+            "time": r.created_at.isoformat()
+        })
+    return {"logs": out}
+
+@app.post("/feedback")
+async def submit_feedback(payload: FeedbackRequest, db: AsyncSession = Depends(get_db)):
+    if not payload.text.strip():
+        raise HTTPException(status_code=400, detail="Feedback cannot be empty")
+    fb = Feedback(text=payload.text.strip())
+    db.add(fb)
+    await db.commit()
+    return {"status": "success", "message": "Feedback submitted"}
+
+@app.get("/feedback")
+async def get_feedback(key: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    q = select(Feedback).order_by(Feedback.created_at.desc()).limit(2000)
+    res = await db.execute(q)
+    rows = res.scalars().all()
+    out = [{"id": r.id, "text": r.text, "time": r.created_at.isoformat()} for r in rows]
+    return {"feedback": out}
 
 @app.get("/admin-stats")
-async def admin_stats(key: str):
+async def admin_stats(key: str, db: AsyncSession = Depends(get_db)):
     if key != ADMIN_KEY:
         return {"error": "Unauthorized"}
 
-    data = load_data()
-    if not data:
+    total_res = await db.execute(select(func.count(TrainingData.id)))
+    total_records = total_res.scalar_one() or 0
+
+    if total_records == 0:
         return {"total_records": 0, "avg_question_length": 0, "avg_answer_length": 0}
 
-    avg_q = sum(len(d["question"]) for d in data) // len(data)
-    avg_a = sum(len(d["answer"]) for d in data) // len(data)
+    avg_q_len_res = await db.execute(select(func.avg(func.length(TrainingData.question))))
+    avg_q = int(avg_q_len_res.scalar_one() or 0)
+
+    avg_a_len_res = await db.execute(select(func.avg(func.length(TrainingData.answer))))
+    avg_a = int(avg_a_len_res.scalar_one() or 0)
 
     return {
-        "total_records": len(data),
+        "total_records": int(total_records),
         "avg_question_length": avg_q,
         "avg_answer_length": avg_a,
     }
 
 @app.delete("/delete-entry")
-async def delete_entry(question: str, key: str):
+async def delete_entry(question: str, key: str, db: AsyncSession = Depends(get_db)):
     if key != ADMIN_KEY:
         return {"error": "Unauthorized"}
 
-    data = load_data()
-    new_data = [d for d in data if d["question"].lower() != question.lower()]
-    save_data(new_data)
-
-    load_memory()  # refresh in-memory knowledge
+    q = select(TrainingData).where(func.lower(TrainingData.question) == question.lower())
+    res = await db.execute(q)
+    item = res.scalars().first()
+    if not item:
+        return {"status": "failed", "message": "Entry not found"}
+    await db.delete(item)
+    await db.commit()
+    await load_memory_from_db(db)
     return {"status": "success", "message": "Entry deleted"}
 
 @app.put("/update-entry")
-async def update_entry(question: str, new_question: str, new_answer: str, new_lang: str, key: str):
+async def update_entry(question: str, new_question: str, new_answer: str, new_lang: str, key: str, db: AsyncSession = Depends(get_db)):
     if key != ADMIN_KEY:
         return {"error": "Unauthorized"}
 
-    data = load_data()
-    updated = False
+    q = select(TrainingData).where(func.lower(TrainingData.question) == question.lower())
+    res = await db.execute(q)
+    item = res.scalars().first()
+    if not item:
+        return {"status": "failed", "message": "Entry not found"}
 
-    for item in data:
-        if item["question"].lower() == question.lower():
-            item["question"] = new_question
-            item["answer"] = new_answer
-            item["lang"] = new_lang
-            updated = True
-            break
-
-    if updated:
-        save_data(data)
-        load_memory()  # refresh chatbot memory
-        return {"status": "success", "message": "Entry updated"}
-
-    return {"status": "failed", "message": "Entry not found"}
-
+    item.question = new_question
+    item.answer = new_answer
+    item.lang = new_lang
+    db.add(item)
+    await db.commit()
+    await load_memory_from_db(db)
+    return {"status": "success", "message": "Entry updated"}
