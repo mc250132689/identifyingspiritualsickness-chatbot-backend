@@ -177,3 +177,26 @@ async def delete_entry(question: str, key: str):
     load_memory()  # refresh in-memory knowledge
     return {"status": "success", "message": "Entry deleted"}
 
+@app.put("/update-entry")
+async def update_entry(question: str, new_question: str, new_answer: str, new_lang: str, key: str):
+    if key != ADMIN_KEY:
+        return {"error": "Unauthorized"}
+
+    data = load_data()
+    updated = False
+
+    for item in data:
+        if item["question"].lower() == question.lower():
+            item["question"] = new_question
+            item["answer"] = new_answer
+            item["lang"] = new_lang
+            updated = True
+            break
+
+    if updated:
+        save_data(data)
+        load_memory()  # refresh chatbot memory
+        return {"status": "success", "message": "Entry updated"}
+
+    return {"status": "failed", "message": "Entry not found"}
+
