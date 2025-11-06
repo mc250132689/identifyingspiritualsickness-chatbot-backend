@@ -164,3 +164,16 @@ async def admin_stats(key: str):
         "avg_question_length": avg_q,
         "avg_answer_length": avg_a,
     }
+
+@app.delete("/delete-entry")
+async def delete_entry(question: str, key: str):
+    if key != ADMIN_KEY:
+        return {"error": "Unauthorized"}
+
+    data = load_data()
+    new_data = [d for d in data if d["question"].lower() != question.lower()]
+    save_data(new_data)
+
+    load_memory()  # refresh in-memory knowledge
+    return {"status": "success", "message": "Entry deleted"}
+
