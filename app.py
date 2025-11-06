@@ -9,7 +9,7 @@ import os
 
 # ------------------ CONFIG ------------------
 DATA_FILE = "training_data.json"
-ADMIN_KEY = os.getenv("ADMIN_KEY", "changeme123")
+ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
 
 # HuggingFace Model Client (GPT-OSS 20B)
 client = InferenceClient(
