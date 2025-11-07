@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-python-dotenv
+huggingface_hub
 langdetect
-transformers
-torch
+requests
