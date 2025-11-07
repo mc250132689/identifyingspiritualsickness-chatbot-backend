@@ -1,7 +1,6 @@
 fastapi
-uvicorn[standard]
-huggingface_hub
+uvicorn
+python-dotenv
 langdetect
-requests
-python-jose[cryptography]
-passlib[bcrypt]
+transformers
+torch
