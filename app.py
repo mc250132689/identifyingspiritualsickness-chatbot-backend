@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import InferenceClient
@@ -8,7 +8,7 @@ import json
 import os
 import requests
 from collections import Counter
-from fastapi import Query
+import threading
 
 # === FastAPI setup ===
 app = FastAPI()
@@ -23,24 +23,26 @@ app.add_middleware(
 HF_TOKEN = os.getenv("HF_TOKEN")
 client = InferenceClient(provider="groq", api_key=HF_TOKEN)
 
-# === Training data file ===
-DATA_FILE = "training_data.json"
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump({"training_data": []}, f, ensure_ascii=False, indent=2)
+# === Persistent JSON storage ===
+DATA_DIR = "data"
+DATA_FILE = os.path.join(DATA_DIR, "training_data.json")
+os.makedirs(DATA_DIR, exist_ok=True)
+data_lock = threading.Lock()
 
-# === In-memory training dictionary ===
-# Structure: trained_answers[lang][question_lower] = answer
+# In-memory dictionary for fast access
 trained_answers = {}
 
 def load_data():
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data_list = json.load(f)["training_data"]
-    # Populate in-memory dictionary
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({"training_data": []}, f, ensure_ascii=False, indent=2)
+    with data_lock:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data_list = json.load(f).get("training_data", [])
     global trained_answers
     trained_answers = {}
     for item in data_list:
-        lang = item["lang"]
+        lang = item.get("lang", "en")
         q = item["question"].lower()
         a = item["answer"]
         if lang not in trained_answers:
@@ -49,14 +51,15 @@ def load_data():
     return data_list
 
 def save_data(data_list):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump({"training_data": data_list}, f, ensure_ascii=False, indent=2)
+    with data_lock:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({"training_data": data_list}, f, ensure_ascii=False, indent=2)
 
 # Initial load
 load_data()
 
+# === Translation utility ===
 def translate(text, source, target):
-    """Translate text using Hugging Face translation models"""
     model_map = {
         ("en", "ms"): "Helsinki-NLP/opus-mt-en-ms",
         ("ms", "en"): "Helsinki-NLP/opus-mt-ms-en",
@@ -87,6 +90,7 @@ class ChatRequest(BaseModel):
 class TrainRequest(BaseModel):
     question: str
     answer: str
+    lang: str = None  # optional, auto-detect if missing
 
 # === Chat endpoint ===
 @app.post("/chat")
@@ -100,14 +104,13 @@ async def chat(req: ChatRequest):
     except Exception:
         lang = "en"
 
-    # 1️⃣ Check in-memory trained answers first
+    # 1️⃣ Check trained answers first
     lang_dict = trained_answers.get(lang, {})
     match = difflib.get_close_matches(user_message.lower(), lang_dict.keys(), n=1, cutoff=0.6)
     if match:
-        answer = lang_dict[match[0]]
-        return {"response": answer}
+        return {"response": lang_dict[match[0]]}
 
-    # 2️⃣ No match → query GPT-OSS via Hugging Face InferenceClient
+    # 2️⃣ Query GPT-OSS
     eng_msg = user_message if lang == "en" else translate(user_message, lang, "en")
     completion = client.chat.completions.create(
         model="openai/gpt-oss-20b",
@@ -125,11 +128,10 @@ async def chat(req: ChatRequest):
     )
     reply = completion.choices[0].message["content"]
 
-    # Translate back if needed
     if lang != "en":
         reply = translate(reply, "en", lang)
 
-    # Save to JSON and in-memory
+    # Save to JSON & in-memory
     data = load_data()
     data.append({"question": user_message, "answer": reply, "lang": lang})
     save_data(data)
@@ -144,16 +146,17 @@ async def chat(req: ChatRequest):
 async def train(req: TrainRequest):
     question = req.question.strip()
     answer = req.answer.strip()
+    lang = req.lang or "en"
+    if not lang:
+        try:
+            lang = detect(question)
+        except Exception:
+            lang = "en"
+
     if not question or not answer:
         return {"message": "Please provide both question and answer."}
 
-    try:
-        lang = detect(question)
-    except Exception:
-        lang = "en"
-
     data = load_data()
-    # Update existing if duplicate
     updated = False
     for item in data:
         if item["lang"] == lang and item["question"].lower() == question.lower():
@@ -163,8 +166,6 @@ async def train(req: TrainRequest):
     if not updated:
         data.append({"question": question, "answer": answer, "lang": lang})
     save_data(data)
-
-    # Update in-memory trained_answers instantly
     if lang not in trained_answers:
         trained_answers[lang] = {}
     trained_answers[lang][question.lower()] = answer
@@ -177,23 +178,18 @@ async def get_training_data():
     data = load_data()
     return {"training_data": data}
 
-# === Admin analytics ===
-ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
+# === Admin features ===
+ADMIN_KEYS = os.getenv("ADMIN_KEYS", "mc250132689").split(",")
 
 @app.get("/admin-stats")
 async def admin_stats(key: str = Query(...)):
-    """Return simple analytics if admin key is correct"""
-    if key != ADMIN_KEY:
+    if key not in ADMIN_KEYS:
         return {"error": "Unauthorized"}
-
     data = load_data()
     total_records = len(data)
     lang_count = Counter(item.get("lang", "unknown") for item in data)
-    
-    # Compute average answer length & question length
     avg_q_len = round(sum(len(item["question"]) for item in data) / total_records, 1) if total_records else 0
     avg_a_len = round(sum(len(item["answer"]) for item in data) / total_records, 1) if total_records else 0
-
     return {
         "total_records": total_records,
         "languages": dict(lang_count),
@@ -201,3 +197,24 @@ async def admin_stats(key: str = Query(...)):
         "avg_answer_length": avg_a_len
     }
 
+@app.delete("/admin-delete")
+async def admin_delete(question: str = Query(None), key: str = Query(...)):
+    if key not in ADMIN_KEYS:
+        return {"error": "Unauthorized"}
+    data = load_data()
+    if question:
+        question_lower = question.lower()
+        data = [item for item in data if item["question"].lower() != question_lower]
+        save_data(data)
+        load_data()
+        return {"message": f"Deleted question: {question}"}
+    else:
+        save_data([])
+        trained_answers.clear()
+        return {"message": "Deleted all training data"}
+
+@app.get("/export-json")
+async def export_json(key: str = Query(...)):
+    if key not in ADMIN_KEYS:
+        return {"error": "Unauthorized"}
+    return {"training_data": load_data()}
