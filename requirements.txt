@@ -1,27 +1,5 @@
-# FastAPI framework
 fastapi==0.121.0
-
-# ASGI server for FastAPI
-uvicorn==0.23.2
-
-# Templating engine for HTML pages
-jinja2==3.1.2
-
-# For handling file uploads in FastAPI
+uvicorn[standard]==0.23.2
 python-multipart==0.0.6
-
-# Pydantic for data validation
-pydantic==2.7.0
-
-# Optional: database drivers (add if you use sqlite/mysql/postgres)
-# sqlite (built-in)
-# MySQL
-mysql-connector-python==8.1.1
-# PostgreSQL
-psycopg2-binary==2.9.9
-
-# Optional: CORS middleware
-fastapi-cors==0.0.3
-
-# Optional: for environment variables
-python-dotenv==1.0.0
+requests==2.32.0
+Jinja2==3.1.3
