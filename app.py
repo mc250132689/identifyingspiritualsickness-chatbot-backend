@@ -12,6 +12,7 @@ import re
 import tempfile
 import shutil
 from typing import List, Optional
+import math
 
 app = FastAPI()
 app.add_middleware(
@@ -455,6 +456,77 @@ async def export_feedback(key: str = Query(None)):
     else:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
+@app.get("/get-feedback")
+def get_feedback():
+    if not os.path.exists(FEEDBACK_FILE):
+        return []
+    with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+STOPWORDS = {
+    "the","a","an","to","and","or","is","are","am","i","you","we","they","it",
+    "this","that","of","in","for","on","my","your","our","with","be","was","were",
+    "have","has","had","but","not","so","do","did","does","at","from","as","by",
+    "about","if","when","then","how","what","why","which","me","he","she","them"
+}
+
+def simple_sentiment(text):
+    text = text.lower()
+    positive_words = ["good","helpful","beneficial","excellent","clear","useful","happy","guided","improved"]
+    negative_words = ["bad","confusing","poor","unclear","not helpful","angry","sad","worse","problem"]
+
+    score = 0
+    for w in positive_words:
+        if w in text:
+            score += 1
+    for w in negative_words:
+        if w in text:
+            score -= 1
+
+    if score > 0:
+        return "positive"
+    elif score < 0:
+        return "negative"
+    return "neutral"
+
+@app.get("/feedback-analysis")
+async def feedback_analysis(key: str = Query(...)):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    try:
+        with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+            fb = json.load(f).get("feedback", [])
+    except Exception:
+        fb = []
+
+    sentiments = {"positive": 0, "neutral": 0, "negative": 0}
+    keyword_counter = Counter()
+
+    for item in fb:
+        comment = (item.get("comments") or "").strip()
+        if not comment:
+            continue
+
+        # sentiment count
+        s = simple_sentiment(comment)
+        sentiments[s] += 1
+
+        # keyword frequency
+        words = re.findall(r"[a-zA-Z]+", comment.lower())
+        for w in words:
+            if w not in STOPWORDS and len(w) > 2:
+                keyword_counter[w] += 1
+
+    top_keywords = [word for word, _ in keyword_counter.most_common(10)]
+
+    return {
+        "feedback_count": len(fb),
+        "sentiments": sentiments,
+        "top_keywords": top_keywords,
+        "feedback_list": fb
+    }
+
 # health
 @app.get("/health")
 async def health():
@@ -464,9 +536,4 @@ async def health():
 async def ping():
     return {"status": "ok"}
 
-@app.get("/get-feedback")
-def get_feedback():
-    if not os.path.exists(FEEDBACK_FILE):
-        return []
-    with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+
