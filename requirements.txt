@@ -3,3 +3,4 @@ uvicorn
 huggingface_hub
 langdetect
 requests
+python-multipart
