@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import requests, os, base64, json
+import requests, os, base64, json, re
 
 app = FastAPI()
 
@@ -26,18 +26,14 @@ def load_training_data():
 
 def save_training_data(data, sha):
     encoded = base64.b64encode(json.dumps(data, indent=4).encode()).decode()
-    payload = {
-        "message": "Updated training data",
-        "content": encoded,
-        "sha": sha
-    }
+    payload = {"message": "Updated training data", "content": encoded, "sha": sha}
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
     requests.put(GITHUB_API_URL, headers=headers, data=json.dumps(payload))
 
 @app.get("/get-training-data")
 def get_training():
-    training_data, _ = load_training_data()
-    return training_data
+    data, _ = load_training_data()
+    return data
 
 @app.post("/train")
 async def train(request: Request):
@@ -70,7 +66,40 @@ async def chat(request: Request):
     if best_answer:
         return {"reply": best_answer}
 
-    return {"reply": "I do not have enough knowledge to answer that yet. Please provide more details."}
+    return {"reply": "I do not have the exact answer yet. Please rephrase or provide more context."}
+
+@app.post("/search-hadith")
+async def search_hadith(request: Request):
+    req = await request.json()
+    query = req.get("query", "").lower()
+
+    # Local hadith dataset (expand later)
+    hadith_list = [
+        {"text": "Actions are judged by intentions.", "source": "Sahih Bukhari"},
+        {"text": "The cure for ignorance is to ask.", "source": "Sunan Abi Dawud"},
+        {"text": "Indeed in the remembrance of Allah do hearts find rest.", "source": "Quran 13:28"}
+    ]
+
+    results = [h for h in hadith_list if query in h["text"].lower()]
+    return {"results": results}
+
+@app.get("/admin/get-data")
+def admin_get():
+    data, _ = load_training_data()
+    return data
+
+@app.post("/admin/delete")
+async def admin_delete(request: Request):
+    req = await request.json()
+    index = req.get("index")
+
+    data, sha = load_training_data()
+    if 0 <= index < len(data):
+        data.pop(index)
+        save_training_data(data, sha)
+        return {"status": "deleted"}
+
+    return {"status": "error", "message": "Invalid index"}
 
 @app.post("/feedback")
 async def feedback(request: Request):
