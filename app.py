@@ -1,12 +1,9 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import requests
-import json
-import os
+import requests, os, base64, json
 
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,66 +20,61 @@ GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{TRAINING
 
 def load_training_data():
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
-    response = requests.get(GITHUB_API_URL, headers=headers).json()
-    file_content = response["content"]
-    decoded = json.loads((file_content.encode("ascii")))
-    return json.loads(decoded)
+    r = requests.get(GITHUB_API_URL, headers=headers).json()
+    decoded_bytes = base64.b64decode(r["content"])
+    return json.loads(decoded_bytes.decode("utf-8")), r["sha"]
 
-def save_training_data(data):
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    # Get current file SHA
-    current = requests.get(GITHUB_API_URL, headers=headers).json()
-    sha = current["sha"]
-
-    encoded_content = json.dumps(data, indent=4)
-
+def save_training_data(data, sha):
+    encoded = base64.b64encode(json.dumps(data, indent=4).encode()).decode()
     payload = {
-        "message": "Update training data via chatbot learning",
-        "content": encoded_content.encode("ascii"),
+        "message": "Updated training data",
+        "content": encoded,
         "sha": sha
     }
-
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
     requests.put(GITHUB_API_URL, headers=headers, data=json.dumps(payload))
 
 @app.get("/get-training-data")
 def get_training():
-    return load_training_data()
+    training_data, _ = load_training_data()
+    return training_data
+
+@app.post("/train")
+async def train(request: Request):
+    req = await request.json()
+    q = req.get("question")
+    a = req.get("answer")
+    data, sha = load_training_data()
+    data.append({"question": q, "answer": a})
+    save_training_data(data, sha)
+    return {"status": "success"}
 
 @app.post("/chat")
 async def chat(request: Request):
-    data = await request.json()
-    user_text = data.get("message", "").lower()
+    req = await request.json()
+    user_text = req.get("message", "").lower()
 
-    training_data = load_training_data()
+    data, _ = load_training_data()
 
-    # Simple semantic matching
     best_answer = None
-    highest_score = 0
+    best_score = 0
 
-    for item in training_data:
+    for item in data:
         question = item["question"].lower()
-        match_score = sum(1 for word in user_text.split() if word in question)
-        if match_score > highest_score:
-            highest_score = match_score
+        words = user_text.split()
+        score = sum(question.count(w) for w in words)
+        if score > best_score:
+            best_score = score
             best_answer = item["answer"]
 
     if best_answer:
         return {"reply": best_answer}
-    else:
-        return {"reply": "I do not have enough knowledge to answer that yet. Please provide more context or rephrase your question."}
 
-@app.post("/train")
-async def train(request: Request):
-    data = await request.json()
-    question = data.get("question")
-    answer = data.get("answer")
+    return {"reply": "I do not have enough knowledge to answer that yet. Please provide more details."}
 
-    training_data = load_training_data()
-    training_data.append({"question": question, "answer": answer})
-    save_training_data(training_data)
-
-    return {"status": "success", "message": "Training data added successfully"}
+@app.post("/feedback")
+async def feedback(request: Request):
+    req = await request.json()
+    with open("/mnt/data/user_feedback.json", "a") as f:
+        f.write(json.dumps(req) + "\n")
+    return {"status": "received"}
