@@ -50,11 +50,64 @@ async def chat(request: Request):
     req = await request.json()
     user_text = req.get("message", "").lower()
 
-    data, _ = load_training_data()
+    # Language Detection
+    def detect_lang(text):
+        malay_words = ["apa", "bagaimana", "kenapa", "saya", "awak", "ruqyah", "jin", "sihir"]
+        arabic_chars = re.compile("[\u0600-\u06FF]+")
+        if arabic_chars.search(text):
+            return "ar"
+        if any(w in text for w in malay_words):
+            return "ms"
+        return "en"
 
+    lang = detect_lang(user_text)
+
+    # Spiritual Sickness Classification
+    categories = {
+        "hasad": ["jealous", "envy", "hasad", "pandangan", "mata", "dipandang"],
+        "sihir": ["black magic", "magic", "santau", "guna", "guni-guni", "witchcraft", "sihir"],
+        "jinn": ["jin", "nightmares", "sleep paralysis", "bisikan", "whisper", "angin", "ketakutan"],
+        "stress": ["stress", "anxiety", "depress", "letih", "penat", "burnout"]
+    }
+
+    def classify(text):
+        results = {k: sum(text.count(w) for w in words) for k, words in categories.items()}
+        best = max(results, key=results.get)
+        return best if results[best] > 0 else None
+
+    result = classify(user_text)
+
+    ruqyah_guidance = {
+        "hasad": {
+            "ms": "Ini mungkin tanda hasad. Amalkan Surah Al-Falaq, An-Naas, Ayat Kursi setiap pagi dan petang.",
+            "en": "This may indicate evil eye (hasad). Recite Al-Falaq, An-Naas, and Ayat Al-Kursi daily.",
+            "ar": "قد يكون هذا من الحسد. اقرأ المعوذتين وآية الكرسي صباحًا ومساءً."
+        },
+        "sihir": {
+            "ms": "Ini mungkin ada unsur sihir. Lakukan ruqyah dengan membaca Surah Al-Baqarah ayat 1-5 dan Ayat Kursi.",
+            "en": "This may indicate black magic. Perform ruqyah with Surah Al-Baqarah and Ayat Al-Kursi.",
+            "ar": "قد يكون سحرًا. قم بالرقية بسورة البقرة وآية الكرسي."
+        },
+        "jinn": {
+            "ms": "Ini mungkin gangguan jin. Banyakkan istighfar, zikir pagi & petang, dan dengar Surah Al-Baqarah.",
+            "en": "This may indicate jinn disturbance. Increase dhikr and play Surah Al-Baqarah.",
+            "ar": "قد يكون مسّ من الجن. أكثر من الذكر واستمع إلى سورة البقرة."
+        },
+        "stress": {
+            "ms": "Ini lebih kepada tekanan emosi. Amalkan doa perlindungan dan rehat secukupnya.",
+            "en": "This appears emotional stress. Engage in dhikr and ensure rest.",
+            "ar": "يبدو أنه إرهاق نفسي. أكثر من الذكر وخذ قسطًا من الراحة."
+        }
+    }
+
+    if result:
+        reply = ruqyah_guidance[result][lang]
+        return {"reply": reply}
+
+    # If no classification matched, fallback to trained data
+    data, _ = load_training_data()
     best_answer = None
     best_score = 0
-
     for item in data:
         question = item["question"].lower()
         words = user_text.split()
@@ -66,7 +119,13 @@ async def chat(request: Request):
     if best_answer:
         return {"reply": best_answer}
 
-    return {"reply": "I do not have the exact answer yet. Please rephrase or provide more context."}
+    fallback = {
+        "ms": "Saya belum mempunyai jawapan lengkap. Sila tambah soalan ini dalam latihan.",
+        "en": "I do not have enough knowledge yet. Please try rephrasing.",
+        "ar": "لا توجد إجابة حالياً. حاول إعادة الصياغة."
+    }
+
+    return {"reply": fallback[lang]}
 
 @app.post("/search-hadith")
 async def search_hadith(request: Request):
