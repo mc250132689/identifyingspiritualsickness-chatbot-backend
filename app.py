@@ -464,3 +464,9 @@ async def health():
 async def ping():
     return {"status": "ok"}
 
+@app.get("/get-feedback")
+def get_feedback():
+    if not os.path.exists(FEEDBACK_FILE):
+        return []
+    with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
