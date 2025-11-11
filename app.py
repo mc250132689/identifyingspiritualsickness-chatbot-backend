@@ -397,7 +397,20 @@ def get_feedback():
     except Exception:
         return []
 
-# --- Health endpoints ---
-@app.get("/")
-def root():
-    return {"message": "Identifying Spiritual Sickness Chatbot API running."}
+# --- Health / Ping endpoints ---
+@app.get("/health")
+async def health():
+    """
+    Simple health check endpoint for monitoring.
+    Returns ok if the server is running.
+    """
+    return {"status": "ok"}
+
+@app.get("/ping")
+async def ping():
+    """
+    Lightweight ping endpoint to check if the server is awake.
+    Can be used by frontend to wake up free-tier hosting servers.
+    """
+    return {"status": "ok", "message": "Server is awake"}
+
