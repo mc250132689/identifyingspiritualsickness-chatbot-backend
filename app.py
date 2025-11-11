@@ -2,7 +2,7 @@ from fastapi import FastAPI, Query, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import InferenceClient
-from langdetect import detect, DetectorFactory
+from langdetect import detect
 import difflib
 import json
 import os
@@ -14,8 +14,6 @@ import shutil
 from typing import List, Optional
 import asyncio
 
-# --- Setup ---
-DetectorFactory.seed = 0  # consistent lang detection
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -24,14 +22,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Hugging Face GPT-OSS client (Groq) ---
 HF_TOKEN = os.getenv("HF_TOKEN")
 client = InferenceClient(api_key=HF_TOKEN)
 
+# --- Ensure data folders exist ---
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "training_data.json")
 FEEDBACK_FILE = os.path.join(DATA_DIR, "feedback.json")
 
+# --- Initialize files if missing ---
 if not os.path.exists(DATA_FILE):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump({"training_data": []}, f, ensure_ascii=False, indent=2)
@@ -42,7 +43,7 @@ if not os.path.exists(FEEDBACK_FILE):
 
 trained_answers = {}
 
-# --- Normalization ---
+# --- Text normalization ---
 _non_alnum_re = re.compile(r"[^\w\s]+", flags=re.UNICODE)
 _multi_space_re = re.compile(r"\s+", flags=re.UNICODE)
 def normalize_text(s: str) -> str:
@@ -84,7 +85,7 @@ def save_data(data_list):
 
 load_data()
 
-# --- Translation ---
+# --- Translation utility ---
 def translate(text, source, target):
     model_map = {
         ("en", "ms"): "Helsinki-NLP/opus-mt-en-ms",
@@ -110,10 +111,11 @@ def translate(text, source, target):
         return text
 
 # --- Hadith extraction ---
-HADITH_KEYWORDS = ["bukhari","muslim","sahih","riyad","tirmidhi","abu dawood","nasai","ibn majah",
-                   "hadith","riyadh","sahih al-bukhari","sahih muslim","malik"]
+HADITH_KEYWORDS = [
+    "bukhari","muslim","sahih","riyad","tirmidhi","abu dawood","nasai","ibn majah",
+    "hadith","riyadh","sahih al-bukhari","sahih muslim","malik"
+]
 HADITH_REF_RE = re.compile(r"(bukhari|sahih al-bukhari|sahih muslim|muslim|tirmidhi|abu dawood|nasai|ibn majah|riyad)\b", flags=re.IGNORECASE)
-
 def extract_hadith_refs(text: str) -> List[str]:
     refs = set()
     if not text: return []
@@ -124,7 +126,17 @@ def extract_hadith_refs(text: str) -> List[str]:
         if kw in lowered: refs.add(kw)
     return list(refs)
 
-# --- Pydantic Models ---
+# --- Async Hugging Face symptom classifier ---
+async def hf_symptom_classify(text: str, model_id: str):
+    try:
+        result = await asyncio.to_thread(lambda: client.text_classification(model=model_id, inputs=text))
+        if result:
+            return result[0]["label"].lower(), result[0]["score"]
+    except Exception:
+        pass
+    return "none", 0.0
+
+# --- Pydantic models ---
 class ChatRequest(BaseModel):
     message: str
 class TrainRequest(BaseModel):
@@ -151,17 +163,7 @@ class FeedbackItem(BaseModel):
     q14: Optional[str] = None
     comments: Optional[str] = None
 
-# --- Shared Async HF symptom inference ---
-async def hf_symptom_classify(text: str, model_id: str):
-    try:
-        result = await asyncio.to_thread(lambda: client.text_classification(model=model_id, inputs=text))
-        if result:
-            return result[0]["label"].lower(), result[0]["score"]
-    except Exception:
-        pass
-    return "none", 0.0
-
-# --- Chat Endpoint ---
+# --- Chat endpoint ---
 @app.post("/chat")
 async def chat(req: ChatRequest):
     user_message = req.message.strip()
@@ -171,42 +173,41 @@ async def chat(req: ChatRequest):
     except Exception: lang = "en"
 
     norm_user = normalize_text(user_message)
-
-    # Step 1: trained answers
     lang_dict = trained_answers.get(lang, {})
-    best_match = None
-    best_score = 0.0
+
+    # --- Step 1: trained answers ---
+    best_match, best_score = None, 0.0
     for original_q, meta in lang_dict.items():
         score = difflib.SequenceMatcher(None, norm_user, meta["norm"]).ratio()
         if score > best_score:
             best_score = score
             best_match = original_q
-
     if best_score >= 0.70 and best_match:
         return {"response": lang_dict[best_match]["answer"]}
 
-    # Step 2: detect likely symptoms
+    # --- Step 2: symptom detection ---
     symptom_keywords = ["voices","see","visions","insomnia","nightmares","dizziness","palpitation","itching","sudden pain","fear","not myself"]
     is_symptoms = any(k in norm_user for k in symptom_keywords)
     label, score = "none", 0.0
-    MODEL_ID = "your-hf-symptoms-classifier"  # replace with your HF model
+    MODEL_ID = "your-hf-symptoms-classifier"
 
     if is_symptoms:
         text_for_model = user_message if lang=="en" else translate(user_message, lang, "en")
         label, score = await hf_symptom_classify(text_for_model, MODEL_ID)
 
-    # Step 3: if confident, return guidance
     if score >= 0.6:
         guidance_labels = {"jin":"jin involvement","sihir":"possible sihr","ruqyah":"symptoms treated with ruqyah"}
         suggestions = [f"Detected symptoms suggest {guidance_labels.get(label,'general ruqyah guidance')}. Consider seeking a qualified ruqyah practitioner and medical check-up."]
         return {"response":"⚠️ Symptom-based guidance provided.","model_label":label,"model_confidence":score,"suggestions":suggestions}
 
-    # Step 4: fallback GPT-OSS chat
+    # --- Step 3: GPT-OSS fallback ---
     eng_msg = user_message if lang=="en" else translate(user_message, lang, "en")
     completion = client.chat.completions.create(
         model="openai/gpt-oss-20b:groq",
-        messages=[{"role":"system","content":"You are an Islamic knowledge assistant specializing in spiritual sickness, jin possession, sihr, ruqyah and Islamic dream interpretation. Your answers MUST only reference Quran, Sahih Hadith, and valid ruqyah practices. Never provide mystical, speculative, or cultural superstition advice."},
-                  {"role":"user","content":eng_msg}]
+        messages=[
+            {"role":"system","content":"You are an Islamic knowledge assistant specializing in spiritual sickness, jin possession, sihr, ruqyah and Islamic dream interpretation. Answers MUST reference Quran, Sahih Hadith, valid ruqyah practices only."},
+            {"role":"user","content":eng_msg}
+        ]
     )
     reply = completion.choices[0].message["content"]
     if lang!="en": reply = translate(reply,"en",lang)
@@ -216,19 +217,112 @@ async def chat(req: ChatRequest):
     entry = {"question":user_message,"answer":reply,"lang":lang,"hadith_refs":hadith_refs}
     data.append(entry)
     save_data(data)
-
     if lang not in trained_answers: trained_answers[lang]={}
-    trained_answers[lang][user_message.lower()]={"answer":reply,"norm":normalize_text(user_message)}
+    trained_answers[lang][user_message.lower()]={"answer":reply,"norm":norm_user}
 
     return {"response":reply,"hadith_refs":hadith_refs}
 
-# --- Guidance Endpoint ---
+# --- Training endpoints ---
+@app.post("/train")
+async def train(req: TrainRequest):
+    question, answer = req.question.strip(), req.answer.strip()
+    if not question or not answer: return {"message": "Please provide both question and answer."}
+    try: lang = detect(question)
+    except Exception: lang = "en"
+
+    data = load_data()
+    updated = False
+    for item in data:
+        if item.get("lang","en")==lang and item.get("question","").strip().lower()==question.lower():
+            item["answer"] = answer
+            item["hadith_refs"] = extract_hadith_refs(answer)
+            updated = True
+            break
+    if not updated:
+        data.append({"question": question, "answer": answer, "lang": lang, "hadith_refs": extract_hadith_refs(answer)})
+    save_data(data)
+    if lang not in trained_answers: trained_answers[lang]={}
+    trained_answers[lang][question.lower()]={"answer": answer, "norm": normalize_text(question)}
+    return {"message": f"{'Updated' if updated else 'Added'} {lang.upper()} training data successfully."}
+
+@app.get("/get-training-data")
+async def get_training_data():
+    return {"training_data": load_data()}
+
+@app.get("/export-training-data")
+async def export_training_data():
+    return {"training_data": load_data()}
+
+@app.post("/import-training-data")
+async def import_training_data(payload: dict):
+    incoming = payload.get("training_data")
+    if not isinstance(incoming, list):
+        raise HTTPException(status_code=400, detail="Invalid payload; expected training_data list")
+    existing = load_data()
+    existing_norms = {normalize_text(i.get("question","")): i for i in existing}
+    merged = existing[:]
+    added = updated = 0
+    for item in incoming:
+        q = item.get("question","").strip()
+        if not q: continue
+        norm = normalize_text(q)
+        if norm in existing_norms:
+            ex_item = existing_norms[norm]
+            if ex_item.get("answer","").strip() != item.get("answer","").strip():
+                ex_item["answer"] = item.get("answer","").strip()
+                ex_item["hadith_refs"] = extract_hadith_refs(ex_item["answer"])
+                updated +=1
+        else:
+            merged.append({
+                "question": q,
+                "answer": item.get("answer","").strip(),
+                "lang": item.get("lang","en"),
+                "hadith_refs": extract_hadith_refs(item.get("answer",""))
+            })
+            added +=1
+    save_data(merged)
+    return {"message": f"Imported. Added: {added}, Updated: {updated}", "added": added, "updated": updated}
+
+# --- Admin & stats ---
+ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
+@app.get("/admin-stats")
+async def admin_stats(key: str = Query(...)):
+    if key != ADMIN_KEY: return {"error": "Unauthorized"}
+    data = load_data()
+    total = len(data)
+    lang_count = Counter(item.get("lang","en") for item in data)
+    avg_q = round(sum(len(i.get("question","")) for i in data)/total,1) if total else 0
+    avg_a = round(sum(len(i.get("answer","")) for i in data)/total,1) if total else 0
+    hadith_count = sum(1 for i in data if i.get("hadith_refs"))
+    hadith_examples = [i for i in data if i.get("hadith_refs")][:5]
+    q_counter = Counter(normalize_text(i.get("question","")) for i in data)
+    top_questions = [q for q,_ in q_counter.most_common(10)]
+    recent = data[-10:] if total else []
+    try:
+        with open(FEEDBACK_FILE,"r",encoding="utf-8") as f: fb=json.load(f).get("feedback",[])
+    except Exception: fb=[]
+    feedback_count = len(fb)
+    return {"total_records": total, "languages": dict(lang_count), "avg_question_length": avg_q, "avg_answer_length": avg_a, "hadith_count": hadith_count, "hadith_examples": hadith_examples, "top_questions": top_questions, "recent_records": recent, "feedback_count": feedback_count}
+
+@app.get("/hadith-search")
+async def hadith_search(q: str = Query(...)):
+    qnorm = normalize_text(q)
+    data = load_data()
+    keywords = HADITH_KEYWORDS
+    results=[]
+    for item in data:
+        combined = f"{item.get('question','')} {item.get('answer','')}"
+        if qnorm in normalize_text(combined) or any(kw in combined.lower() for kw in keywords):
+            results.append(item)
+    return {"query": q, "count": len(results), "results": results}
+
+# --- Guidance endpoint (async HF integrated) ---
 @app.post("/guidance")
 async def guidance(req: GuidanceRequest):
-    symptoms = (req.symptoms or "").strip()
+    symptoms = (req.symptoms or "") + " " + (req.details or "")
     s = normalize_text(symptoms)
-    label, score = "none", 0.0
-    lang = "en"
+    label, score = "none",0.0
+    lang="en"
     if symptoms:
         try: lang = detect(symptoms)
         except Exception: lang="en"
@@ -236,8 +330,8 @@ async def guidance(req: GuidanceRequest):
         MODEL_ID = "your-hf-symptoms-classifier"
         label, score = await hf_symptom_classify(text_for_model, MODEL_ID)
 
-    threshold = 0.6
-    if score < threshold or not symptoms:
+    threshold=0.6
+    if score<threshold or not symptoms:
         keywords_jin = ["voices","hear voices","see","seeing","visions","speaking","possession","control me","not myself","sudden change"]
         keywords_sihir = ["sudden illness","sudden poverty","bad luck","marriage problem","family problem","sudden hatred","sudden fear"]
         keywords_ruqyah = ["insomnia","nightmares","sleepless","dizziness","palpitation","weird smell","itching","sudden pain"]
@@ -253,27 +347,57 @@ async def guidance(req: GuidanceRequest):
     severity="low"
     if matched_jin:
         severity="high"
-        suggestions.append("Signs suggest possible jin involvement. Consider seeking a qualified ruqyah practitioner (Islamically-sound) and an accredited medical opinion.")
-        suggestions.append("Checklist: check for changes in voice, sudden behaviours, aversion to Qur'an, physical marks.")
+        suggestions.append("Signs suggest possible jin involvement. Seek qualified ruqyah practitioner & medical opinion.")
     if matched_sihir:
         severity="medium" if severity!="high" else severity
-        suggestions.append("Signs suggest possible sihr (black magic). Recommended: document incidents, seek ruqyah, and verify with trusted scholars/practitioners.")
+        suggestions.append("Signs suggest possible sihr. Document, seek ruqyah & verify with scholars.")
     if matched_ruqyah:
         severity="medium"
-        suggestions.append("Symptoms match many cases treated with ruqyah. Follow Quranic ruqyah steps and consult a reliable practitioner.")
+        suggestions.append("Symptoms match ruqyah-treated cases. Follow Quranic ruqyah steps.")
+
     if not (matched_jin or matched_sihir or matched_ruqyah):
-        suggestions.append("Symptoms are not strongly suggestive of jin/sihr based on keyword heuristics. Seek medical check first; consult an imam/scholar if symptoms persist.")
+        suggestions.append("Symptoms not strongly suggestive of jin/sihr. Seek medical check, consult scholar.")
         severity="low"
 
     steps=[
-        "1) Seek immediate medical check-up to rule out physiological causes.",
-        "2) If medical causes are ruled out or in parallel, consult a qualified ruqyah practitioner who uses Quran & authentic hadith-guided ruqyah.",
-        "3) Maintain remembrance (adhkar), regular prayer, and recitation of Surah Al-Fatihah, Ayat al-Kursi (2:255), last two surahs.",
-        "4) Avoid unqualified practitioners, superstitious rituals, or any un-Islamic practices."
+        "1) Seek immediate medical check-up.",
+        "2) Consult qualified ruqyah practitioner using Quran & authentic hadith.",
+        "3) Maintain adhkar, prayer, Surah Al-Fatihah, Ayat al-Kursi, last two surahs.",
+        "4) Avoid unqualified practitioners or un-Islamic practices."
     ]
 
     return {"severity":severity,"matched_jin":matched_jin,"matched_sihir":matched_sihir,"matched_ruqyah":matched_ruqyah,"suggestions":suggestions,"recommended_steps":steps,"model_label":label,"model_confidence":score,"language_detected":lang}
 
-# --- Other endpoints like /train, /get-training-data, /submit-feedback remain unchanged ---
-# (Copy them from your original app.py; they do not require modifications)
+# --- Feedback endpoints ---
+@app.post("/submit-feedback")
+async def submit_feedback(item: FeedbackItem):
+    try:
+        with open(FEEDBACK_FILE,"r",encoding="utf-8") as f: fb=json.load(f).get("feedback",[])
+    except Exception: fb=[]
+    fb.append(item.dict())
+    atomic_write_json(FEEDBACK_FILE, {"feedback": fb})
+    return {"message": "Feedback submitted. Jazakallah khair."}
 
+@app.get("/export-feedback")
+async def export_feedback(key: str = Query(None)):
+    if key and key==ADMIN_KEY:
+        try:
+            with open(FEEDBACK_FILE,"r",encoding="utf-8") as f: fb=json.load(f)
+        except Exception: fb={"feedback": []}
+        return fb
+    else:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+@app.get("/get-feedback")
+def get_feedback():
+    if not os.path.exists(FEEDBACK_FILE): return []
+    try:
+        with open(FEEDBACK_FILE,"r",encoding="utf-8") as f:
+            return json.load(f).get("feedback",[])
+    except Exception:
+        return []
+
+# --- Health endpoints ---
+@app.get("/")
+def root():
+    return {"message": "Identifying Spiritual Sickness Chatbot API running."}
