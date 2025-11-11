@@ -460,34 +460,12 @@ async def export_feedback(key: str = Query(None)):
 def get_feedback():
     if not os.path.exists(FEEDBACK_FILE):
         return []
-    with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-STOPWORDS = {
-    "the","a","an","to","and","or","is","are","am","i","you","we","they","it",
-    "this","that","of","in","for","on","my","your","our","with","be","was","were",
-    "have","has","had","but","not","so","do","did","does","at","from","as","by",
-    "about","if","when","then","how","what","why","which","me","he","she","them"
-}
-
-def simple_sentiment(text):
-    text = text.lower()
-    positive_words = ["good","helpful","beneficial","excellent","clear","useful","happy","guided","improved"]
-    negative_words = ["bad","confusing","poor","unclear","not helpful","angry","sad","worse","problem"]
-
-    score = 0
-    for w in positive_words:
-        if w in text:
-            score += 1
-    for w in negative_words:
-        if w in text:
-            score -= 1
-
-    if score > 0:
-        return "positive"
-    elif score < 0:
-        return "negative"
-    return "neutral"
+    try:
+        with open(FEEDBACK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("feedback", [])
+    except Exception:
+        return []
 
 @app.get("/feedback-analysis")
 async def feedback_analysis(key: str = Query(...)):
