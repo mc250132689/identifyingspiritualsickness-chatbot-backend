@@ -5,3 +5,5 @@ langdetect
 requests
 python-multipart
 pydantic
+aiohttp
+aiofiles
