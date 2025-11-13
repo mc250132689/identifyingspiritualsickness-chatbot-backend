@@ -467,12 +467,20 @@ async def keep_awake_task():
         await session.close()
 
 # ---------------------------
-# Background tasks: GitHub backup
+# GitHub backup & restore utils
 # ---------------------------
 async def run_git_command(cmd_args, cwd=None, check=False, env=None):
     def _run():
         try:
-            res = subprocess.run(cmd_args, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=True)
+            res = subprocess.run(
+                cmd_args,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=check,
+                text=True
+            )
             return res.returncode, res.stdout, res.stderr
         except Exception as e:
             return 1, "", str(e)
@@ -482,44 +490,58 @@ async def auto_backup_to_github():
     if not GH_TOKEN:
         print("[BACKUP] GH_TOKEN not set; skipping backup")
         return
+
     remote_url = f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"
     local_repo_dir = os.path.join(DATA_DIR, ".local_git")
     os.makedirs(local_repo_dir, exist_ok=True)
+
+    # Initialize repo once
     if not os.path.exists(os.path.join(local_repo_dir, ".git")):
         await run_git_command(["git","init"], cwd=local_repo_dir)
         await run_git_command(["git","remote","add","origin",remote_url], cwd=local_repo_dir)
+
     while True:
         try:
             timestamp = datetime.datetime.utcnow().isoformat()
-            for fname in ["database.db"]:
-                src = os.path.join(DATA_DIR, fname)
-                dst = os.path.join(local_repo_dir, fname)
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-            await run_git_command(["git","add","."], cwd=local_repo_dir)
-            await run_git_command(["git","commit","-m", f"Auto backup {timestamp}"], cwd=local_repo_dir, check=False)
-            await run_git_command(["git","push","origin",f"HEAD:{GITHUB_BRANCH}"], cwd=local_repo_dir, check=False)
-            print(f"[BACKUP] pushed backup at {timestamp}")
+            # Copy database to local repo
+            src = os.path.join(DATA_DIR, "database.db")
+            dst = os.path.join(local_repo_dir, "database.db")
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                print(f"[BACKUP] database.db copied to local repo at {timestamp}")
+
+            # Stage changes
+            await run_git_command(["git","add","database.db"], cwd=local_repo_dir)
+
+            # Commit only if changes exist
+            retcode, stdout, _ = await run_git_command(["git","status","--porcelain"], cwd=local_repo_dir)
+            if stdout.strip():
+                await run_git_command(["git","commit","-m", f"Auto backup {timestamp}"], cwd=local_repo_dir, check=False)
+                await run_git_command(["git","push","origin",f"HEAD:{GITHUB_BRANCH}"], cwd=local_repo_dir, check=False)
+                print(f"[BACKUP] pushed backup at {timestamp}")
+            else:
+                print(f"[BACKUP] no changes to commit at {timestamp}")
+
         except Exception as e:
             print("[BACKUP] exception:", e)
-        await asyncio.sleep(1800)  # 30 minutes
+
+        await asyncio.sleep(1800)  # every 30 minutes
 
 # ---------------------------
-# Auto restore from GitHub (conditional)
+# Auto restore (conditional)
 # ---------------------------
 async def auto_restore_from_github():
     if not GH_TOKEN:
         print("[RESTORE] GH_TOKEN not set; skipping restore")
         return
+
     local_db_path = os.path.join(DATA_DIR, "database.db")
     restore_needed = False
 
-    # Restore only if database.db missing or empty
     if not os.path.exists(local_db_path):
         restore_needed = True
         print("[RESTORE] database.db missing locally, will restore from GitHub")
     else:
-        # Check if table exists / has data
         try:
             conn = sqlite3.connect(local_db_path)
             c = conn.cursor()
@@ -556,12 +578,13 @@ async def auto_restore_from_github():
         print("[RESTORE] No database.db found in GitHub backup")
 
 # ---------------------------
-# Periodic restore task (every 2 hours, conditional)
+# Periodic restore task (every 2 hours)
 # ---------------------------
 async def periodic_restore_from_github():
     if not GH_TOKEN:
         print("[RESTORE] GH_TOKEN not set; skipping periodic restore")
         return
+
     local_db_path = os.path.join(DATA_DIR, "database.db")
     local_repo_dir = os.path.join(DATA_DIR, ".local_git")
     os.makedirs(local_repo_dir, exist_ok=True)
@@ -600,7 +623,8 @@ async def periodic_restore_from_github():
             except Exception as e:
                 print("[RESTORE] periodic restore error:", e)
 
-        await asyncio.sleep(7200)  # 2 hours
+        await asyncio.sleep(7200)  # every 2 hours
+
 
 # ---------------------------
 # Startup hooks
