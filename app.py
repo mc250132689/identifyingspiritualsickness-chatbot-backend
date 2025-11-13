@@ -1,4 +1,3 @@
-# app.py
 from fastapi import FastAPI, Query, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,33 +17,6 @@ import aiohttp
 import subprocess
 import datetime
 import sqlite3
-
-
-# ---------------------------
-# Auto restore from GitHub
-# ---------------------------
-async def auto_restore_from_github():
-    if not GH_TOKEN:
-        print("[RESTORE] GH_TOKEN not set; skipping restore")
-        return
-    remote_url = f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"
-    local_repo_dir = os.path.join(DATA_DIR, ".local_git")
-    os.makedirs(local_repo_dir, exist_ok=True)
-    if not os.path.exists(os.path.join(local_repo_dir, ".git")):
-        await run_git_command(["git","init"], cwd=local_repo_dir)
-        await run_git_command(["git","remote","add","origin",remote_url], cwd=local_repo_dir)
-    # Fetch latest
-    await run_git_command(["git","fetch","origin"], cwd=local_repo_dir)
-    # Checkout branch
-    await run_git_command(["git","checkout","-B", GITHUB_BRANCH, f"origin/{GITHUB_BRANCH}"], cwd=local_repo_dir)
-    # Copy database.db if exists
-    src = os.path.join(local_repo_dir, "database.db")
-    dst = os.path.join(DATA_DIR, "database.db")
-    if os.path.exists(src):
-        shutil.copy2(src, dst)
-        print("[RESTORE] database.db restored from GitHub backup")
-    else:
-        print("[RESTORE] No database.db found in GitHub backup")
 
 # ---------------------------
 # Basic app + CORS
@@ -196,8 +168,6 @@ def load_data_into_memory():
         trained_answers[lang][q.lower()] = {"answer": a, "norm": normalize_text(q)}
     conn.close()
 
-load_data_into_memory()
-
 # ---------------------------
 # Chat endpoint
 # ---------------------------
@@ -343,13 +313,6 @@ async def export_feedback(key: str = Query(None)):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
-# ---------------------------
-# Startup
-# ---------------------------
-@app.on_event("startup")
-async def startup_event():
-    load_data_into_memory()
 
 # ---------------------------
 # Guidance endpoint
@@ -542,12 +505,114 @@ async def auto_backup_to_github():
         await asyncio.sleep(1800)  # 30 minutes
 
 # ---------------------------
+# Auto restore from GitHub (conditional)
+# ---------------------------
+async def auto_restore_from_github():
+    if not GH_TOKEN:
+        print("[RESTORE] GH_TOKEN not set; skipping restore")
+        return
+    local_db_path = os.path.join(DATA_DIR, "database.db")
+    restore_needed = False
+
+    # Restore only if database.db missing or empty
+    if not os.path.exists(local_db_path):
+        restore_needed = True
+        print("[RESTORE] database.db missing locally, will restore from GitHub")
+    else:
+        # Check if table exists / has data
+        try:
+            conn = sqlite3.connect(local_db_path)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM training_data")
+            count = c.fetchone()[0]
+            conn.close()
+            if count == 0:
+                restore_needed = True
+                print("[RESTORE] database.db empty, will restore from GitHub")
+        except Exception:
+            restore_needed = True
+            print("[RESTORE] database.db corrupted or inaccessible, will restore from GitHub")
+
+    if not restore_needed:
+        print("[RESTORE] Local database exists and has data; skipping restore")
+        return
+
+    # GitHub restore
+    remote_url = f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"
+    local_repo_dir = os.path.join(DATA_DIR, ".local_git")
+    os.makedirs(local_repo_dir, exist_ok=True)
+    if not os.path.exists(os.path.join(local_repo_dir, ".git")):
+        await run_git_command(["git","init"], cwd=local_repo_dir)
+        await run_git_command(["git","remote","add","origin",remote_url], cwd=local_repo_dir)
+
+    await run_git_command(["git","fetch","origin"], cwd=local_repo_dir)
+    await run_git_command(["git","checkout","-B", GITHUB_BRANCH, f"origin/{GITHUB_BRANCH}"], cwd=local_repo_dir)
+    src = os.path.join(local_repo_dir, "database.db")
+    if os.path.exists(src):
+        shutil.copy2(src, local_db_path)
+        print("[RESTORE] database.db restored from GitHub backup")
+        load_data_into_memory()
+    else:
+        print("[RESTORE] No database.db found in GitHub backup")
+
+# ---------------------------
+# Periodic restore task (every 2 hours, conditional)
+# ---------------------------
+async def periodic_restore_from_github():
+    if not GH_TOKEN:
+        print("[RESTORE] GH_TOKEN not set; skipping periodic restore")
+        return
+    local_db_path = os.path.join(DATA_DIR, "database.db")
+    local_repo_dir = os.path.join(DATA_DIR, ".local_git")
+    os.makedirs(local_repo_dir, exist_ok=True)
+    if not os.path.exists(os.path.join(local_repo_dir, ".git")):
+        await run_git_command(["git","init"], cwd=local_repo_dir)
+        await run_git_command(["git","remote","add","origin",f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"], cwd=local_repo_dir)
+
+    while True:
+        restore_needed = False
+        if not os.path.exists(local_db_path):
+            restore_needed = True
+            print("[RESTORE] database.db missing locally, will restore from GitHub")
+        else:
+            try:
+                conn = sqlite3.connect(local_db_path)
+                c = conn.cursor()
+                c.execute("SELECT COUNT(*) FROM training_data")
+                count = c.fetchone()[0]
+                conn.close()
+                if count == 0:
+                    restore_needed = True
+                    print("[RESTORE] database.db empty, will restore from GitHub")
+            except Exception:
+                restore_needed = True
+                print("[RESTORE] database.db corrupted or inaccessible, will restore from GitHub")
+
+        if restore_needed:
+            try:
+                await run_git_command(["git","fetch","origin"], cwd=local_repo_dir)
+                await run_git_command(["git","checkout","-B", GITHUB_BRANCH, f"origin/{GITHUB_BRANCH}"], cwd=local_repo_dir)
+                src = os.path.join(local_repo_dir, "database.db")
+                if os.path.exists(src):
+                    shutil.copy2(src, local_db_path)
+                    print(f"[RESTORE] database.db restored from GitHub at {datetime.datetime.utcnow().isoformat()}")
+                    load_data_into_memory()
+            except Exception as e:
+                print("[RESTORE] periodic restore error:", e)
+
+        await asyncio.sleep(7200)  # 2 hours
+
+# ---------------------------
 # Startup hooks
 # ---------------------------
 @app.on_event("startup")
 async def startup_event():
     if GH_TOKEN:
-        await auto_restore_from_github()   # <-- auto-restore first
+        # Initial conditional restore
+        await auto_restore_from_github()
+        # Start periodic restore task
+        asyncio.create_task(periodic_restore_from_github())
+
     load_data_into_memory()
     asyncio.create_task(keep_awake_task())
     if GH_TOKEN:
