@@ -19,6 +19,33 @@ import subprocess
 import datetime
 import sqlite3
 
+
+# ---------------------------
+# Auto restore from GitHub
+# ---------------------------
+async def auto_restore_from_github():
+    if not GH_TOKEN:
+        print("[RESTORE] GH_TOKEN not set; skipping restore")
+        return
+    remote_url = f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"
+    local_repo_dir = os.path.join(DATA_DIR, ".local_git")
+    os.makedirs(local_repo_dir, exist_ok=True)
+    if not os.path.exists(os.path.join(local_repo_dir, ".git")):
+        await run_git_command(["git","init"], cwd=local_repo_dir)
+        await run_git_command(["git","remote","add","origin",remote_url], cwd=local_repo_dir)
+    # Fetch latest
+    await run_git_command(["git","fetch","origin"], cwd=local_repo_dir)
+    # Checkout branch
+    await run_git_command(["git","checkout","-B", GITHUB_BRANCH, f"origin/{GITHUB_BRANCH}"], cwd=local_repo_dir)
+    # Copy database.db if exists
+    src = os.path.join(local_repo_dir, "database.db")
+    dst = os.path.join(DATA_DIR, "database.db")
+    if os.path.exists(src):
+        shutil.copy2(src, dst)
+        print("[RESTORE] database.db restored from GitHub backup")
+    else:
+        print("[RESTORE] No database.db found in GitHub backup")
+
 # ---------------------------
 # Basic app + CORS
 # ---------------------------
@@ -519,6 +546,8 @@ async def auto_backup_to_github():
 # ---------------------------
 @app.on_event("startup")
 async def startup_event():
+    if GH_TOKEN:
+        await auto_restore_from_github()   # <-- auto-restore first
     load_data_into_memory()
     asyncio.create_task(keep_awake_task())
     if GH_TOKEN:
