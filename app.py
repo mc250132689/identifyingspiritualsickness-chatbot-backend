@@ -1,3 +1,4 @@
+# app.py (Postgres / Neon ready)
 from fastapi import FastAPI, Query, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -9,14 +10,13 @@ import os
 import requests
 from collections import Counter
 import re
-import tempfile
-import shutil
 from typing import List, Optional
 import asyncio
 import aiohttp
-import subprocess
 import datetime
-import sqlite3
+import psycopg2
+import psycopg2.extras
+import sqlite3  # only used by the local migration helper
 
 # ---------------------------
 # Basic app + CORS
@@ -31,53 +31,86 @@ app.add_middleware(
 )
 
 # ---------------------------
-# Config
+# Config / HF client
 # ---------------------------
 HF_TOKEN = os.getenv("HF_TOKEN")
 client = InferenceClient(api_key=HF_TOKEN) if HF_TOKEN else None
 
-GITHUB_REPO = "https://github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-GH_TOKEN = os.getenv("GH_TOKEN")
 APP_URL = os.getenv("APP_URL", "https://identifyingspiritualsickness-chatbot.onrender.com")
 ADMIN_KEY = os.getenv("ADMIN_KEY", "mc250132689")
 
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
+# Postgres connection config (prefer DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_PORT = os.getenv("DB_PORT", "5432")
+CHANNEL_BINDING = os.getenv("CHANNEL_BINDING")  # e.g. "require"
+SSLMODE = os.getenv("SSLMODE", "require")
 
 # ---------------------------
-# SQLite setup
+# PostgreSQL helpers
 # ---------------------------
-DB_FILE = os.path.join(DATA_DIR, "database.db")
+def build_dsn_from_env():
+    """Return a DSN string for psycopg2 from env vars, or DATABASE_URL if provided."""
+    if DATABASE_URL:
+        # psycopg2 accepts the URL directly
+        return DATABASE_URL
+    # Build a DSN; include sslmode and channel_binding if provided
+    params = {
+        "user": DB_USER,
+        "password": DB_PASS,
+        "host": DB_HOST,
+        "port": DB_PORT,
+        "dbname": DB_NAME,
+    }
+    dsn_parts = []
+    for k, v in params.items():
+        if v is not None and v != "":
+            dsn_parts.append(f"{k}={v}")
+    if SSLMODE:
+        dsn_parts.append(f"sslmode={SSLMODE}")
+    if CHANNEL_BINDING:
+        # psycopg2 supports channel_binding as a libpq param
+        dsn_parts.append(f"channel_binding={CHANNEL_BINDING}")
+    return " ".join(dsn_parts)
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
+    """
+    Returns a new psycopg2 connection. Caller must close().
+    Uses DATABASE_URL if provided, otherwise builds DSN from DB_* env vars.
+    """
+    dsn = build_dsn_from_env()
+    # psycopg2.connect accepts both a libpq-style DSN string and a URL
+    conn = psycopg2.connect(dsn)
     return conn
 
 def init_db():
     conn = get_db()
-    c = conn.cursor()
-    # Training data table
-    c.execute('''
+    cur = conn.cursor()
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS training_data (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         question TEXT NOT NULL,
         answer TEXT NOT NULL,
         lang TEXT NOT NULL,
-        hadith_refs TEXT
+        hadith_refs TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    ''')
-    # Feedback table
-    c.execute('''
+    """)
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS feedback (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        data TEXT
+        id SERIAL PRIMARY KEY,
+        data JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    ''')
+    """)
     conn.commit()
+    cur.close()
     conn.close()
 
+# Attempt to create tables at start (idempotent)
 init_db()
 
 # ---------------------------
@@ -154,19 +187,26 @@ trained_answers = {}
 
 def load_data_into_memory():
     conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM training_data")
-    rows = c.fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM training_data ORDER BY id ASC")
+    rows = cur.fetchall()
     global trained_answers
     trained_answers = {}
     for item in rows:
         lang = item["lang"]
-        q = item["question"].strip()
+        q = (item["question"] or "").strip()
         a = item["answer"]
         if lang not in trained_answers:
             trained_answers[lang] = {}
         trained_answers[lang][q.lower()] = {"answer": a, "norm": normalize_text(q)}
+    cur.close()
     conn.close()
+
+# load to memory on import (safe)
+try:
+    load_data_into_memory()
+except Exception as e:
+    print("[STARTUP] load_data_into_memory error:", e)
 
 # ---------------------------
 # Chat endpoint
@@ -224,12 +264,17 @@ async def chat(req: ChatRequest):
         reply = "Model client not configured on server."
 
     hadith_refs = extract_hadith_refs(reply)
+    # persist to postgres
     conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT INTO training_data(question,answer,lang,hadith_refs) VALUES (?,?,?,?)",
-              (user_message, reply, lang, json.dumps(hadith_refs)))
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO training_data (question, answer, lang, hadith_refs) VALUES (%s, %s, %s, %s)",
+        (user_message, reply, lang, json.dumps(hadith_refs))
+    )
     conn.commit()
+    cur.close()
     conn.close()
+
     # update memory cache
     if lang not in trained_answers: trained_answers[lang] = {}
     trained_answers[lang][user_message.lower()] = {"answer": reply, "norm": normalize_text(user_message)}
@@ -248,21 +293,23 @@ async def train(req: TrainRequest):
         lang = detect(question)
     except:
         lang = "en"
+
     conn = get_db()
-    c = conn.cursor()
-    # Check existing
-    c.execute("SELECT id FROM training_data WHERE lower(question)=? AND lang=?", (question.lower(), lang))
-    row = c.fetchone()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id FROM training_data WHERE lower(question)=%s AND lang=%s", (question.lower(), lang))
+    row = cur.fetchone()
     if row:
-        c.execute("UPDATE training_data SET answer=?, hadith_refs=? WHERE id=?",
-                  (answer, json.dumps(extract_hadith_refs(answer)), row["id"]))
+        cur.execute("UPDATE training_data SET answer=%s, hadith_refs=%s WHERE id=%s",
+                    (answer, json.dumps(extract_hadith_refs(answer)), row["id"]))
         msg = "Updated training data successfully."
     else:
-        c.execute("INSERT INTO training_data(question, answer, lang, hadith_refs) VALUES (?,?,?,?)",
-                  (question, answer, lang, json.dumps(extract_hadith_refs(answer))))
+        cur.execute("INSERT INTO training_data (question, answer, lang, hadith_refs) VALUES (%s, %s, %s, %s)",
+                    (question, answer, lang, json.dumps(extract_hadith_refs(answer))))
         msg = "Added training data successfully."
     conn.commit()
+    cur.close()
     conn.close()
+
     # Update memory
     if lang not in trained_answers: trained_answers[lang] = {}
     trained_answers[lang][question.lower()] = {"answer": answer, "norm": normalize_text(question)}
@@ -271,9 +318,10 @@ async def train(req: TrainRequest):
 @app.get("/get-training-data")
 async def get_training_data():
     conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM training_data")
-    rows = c.fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM training_data ORDER BY id ASC")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     data = []
     for r in rows:
@@ -289,9 +337,10 @@ async def get_training_data():
 @app.post("/submit-feedback")
 async def submit_feedback(item: FeedbackItem):
     conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT INTO feedback(data) VALUES (?)", (json.dumps(item.dict()),))
+    cur = conn.cursor()
+    cur.execute("INSERT INTO feedback (data) VALUES (%s)", (json.dumps(item.dict()),))
     conn.commit()
+    cur.close()
     conn.close()
     return {"message": "Feedback submitted. Jazakallah khair."}
 
@@ -300,19 +349,13 @@ async def export_feedback(key: str = Query(None)):
     if key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
     conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM feedback")
-    rows = c.fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM feedback ORDER BY id ASC")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
-    out = [json.loads(r["data"]) for r in rows]
+    out = [r["data"] for r in rows]
     return {"feedback": out}
-
-# ---------------------------
-# Health endpoint
-# ---------------------------
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
 
 # ---------------------------
 # Guidance endpoint
@@ -386,14 +429,15 @@ async def guidance(req: GuidanceRequest):
 async def hadith_search(q: str = Query(...)):
     qnorm = normalize_text(q)
     conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM training_data")
-    rows = c.fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM training_data ORDER BY id ASC")
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     keywords = HADITH_KEYWORDS
     results = []
     for item in rows:
-        combined = f"{item['question']} {item['answer']}"
+        combined = f"{item['question'] or ''} {item['answer'] or ''}"
         if qnorm in normalize_text(combined) or any(kw in combined.lower() for kw in keywords):
             results.append({
                 "id": item["id"],
@@ -412,9 +456,9 @@ async def admin_stats(key: str = Query(...)):
     if key != ADMIN_KEY:
         return {"error": "Unauthorized"}
     conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM training_data")
-    data = c.fetchall()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM training_data ORDER BY id ASC")
+    data = cur.fetchall()
     total = len(data)
     lang_count = Counter(item["lang"] for item in data)
     avg_q = round(sum(len(i["question"]) for i in data)/total, 1) if total else 0
@@ -425,10 +469,10 @@ async def admin_stats(key: str = Query(...)):
     top_questions = [q for q,_ in q_counter.most_common(10)]
     recent = [dict(i) for i in data[-10:]] if total else []
 
-    # feedback count
-    c.execute("SELECT * FROM feedback")
-    fb = c.fetchall()
+    cur.execute("SELECT * FROM feedback ORDER BY id ASC")
+    fb = cur.fetchall()
     feedback_count = len(fb)
+    cur.close()
     conn.close()
 
     return {
@@ -467,178 +511,69 @@ async def keep_awake_task():
         await session.close()
 
 # ---------------------------
-# GitHub backup & restore utils
+# Local migration helper (run manually, only if you have a local copy of the sqlite DB)
 # ---------------------------
-async def run_git_command(cmd_args, cwd=None, check=False, env=None):
-    def _run():
-        try:
-            res = subprocess.run(
-                cmd_args,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=check,
-                text=True
-            )
-            return res.returncode, res.stdout, res.stderr
-        except Exception as e:
-            return 1, "", str(e)
-    return await asyncio.to_thread(_run)
-
-async def auto_backup_to_github():
-    if not GH_TOKEN:
-        print("[BACKUP] GH_TOKEN not set; skipping backup")
+def migrate_sqlite_to_postgres(sqlite_path: str):
+    """
+    One-shot helper to migrate your local SQLite database (data/database.db)
+    into the Postgres DB configured by env vars. Run this locally where your
+    sqlite file exists, with DATABASE_URL or DB_* env vars set.
+    """
+    if not os.path.exists(sqlite_path):
+        print("SQLite file not found:", sqlite_path)
         return
+    # read sqlite data
+    sconn = sqlite3.connect(sqlite_path)
+    scur = sconn.cursor()
+    scur.execute("SELECT id, question, answer, lang, hadith_refs FROM training_data")
+    rows = scur.fetchall()
+    scur.close()
+    sconn.close()
 
-    remote_url = f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"
-    local_repo_dir = os.path.join(DATA_DIR, ".local_git")
-    os.makedirs(local_repo_dir, exist_ok=True)
-
-    # Initialize repo once
-    if not os.path.exists(os.path.join(local_repo_dir, ".git")):
-        await run_git_command(["git","init"], cwd=local_repo_dir)
-        await run_git_command(["git","remote","add","origin",remote_url], cwd=local_repo_dir)
-
-    while True:
-        try:
-            timestamp = datetime.datetime.utcnow().isoformat()
-            # Copy database to local repo
-            src = os.path.join(DATA_DIR, "database.db")
-            dst = os.path.join(local_repo_dir, "database.db")
-            if os.path.exists(src):
-                shutil.copy2(src, dst)
-                print(f"[BACKUP] database.db copied to local repo at {timestamp}")
-
-            # Stage changes
-            await run_git_command(["git","add","database.db"], cwd=local_repo_dir)
-
-            # Commit only if changes exist
-            retcode, stdout, _ = await run_git_command(["git","status","--porcelain"], cwd=local_repo_dir)
-            if stdout.strip():
-                await run_git_command(["git","commit","-m", f"Auto backup {timestamp}"], cwd=local_repo_dir, check=False)
-                await run_git_command(["git","push","origin",f"HEAD:{GITHUB_BRANCH}"], cwd=local_repo_dir, check=False)
-                print(f"[BACKUP] pushed backup at {timestamp}")
-            else:
-                print(f"[BACKUP] no changes to commit at {timestamp}")
-
-        except Exception as e:
-            print("[BACKUP] exception:", e)
-
-        await asyncio.sleep(1800)  # every 30 minutes
-
-# ---------------------------
-# Auto restore (conditional)
-# ---------------------------
-async def auto_restore_from_github():
-    if not GH_TOKEN:
-        print("[RESTORE] GH_TOKEN not set; skipping restore")
-        return
-
-    local_db_path = os.path.join(DATA_DIR, "database.db")
-    restore_needed = False
-
-    if not os.path.exists(local_db_path):
-        restore_needed = True
-        print("[RESTORE] database.db missing locally, will restore from GitHub")
-    else:
-        try:
-            conn = sqlite3.connect(local_db_path)
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM training_data")
-            count = c.fetchone()[0]
-            conn.close()
-            if count == 0:
-                restore_needed = True
-                print("[RESTORE] database.db empty, will restore from GitHub")
-        except Exception:
-            restore_needed = True
-            print("[RESTORE] database.db corrupted or inaccessible, will restore from GitHub")
-
-    if not restore_needed:
-        print("[RESTORE] Local database exists and has data; skipping restore")
-        return
-
-    # GitHub restore
-    remote_url = f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"
-    local_repo_dir = os.path.join(DATA_DIR, ".local_git")
-    os.makedirs(local_repo_dir, exist_ok=True)
-    if not os.path.exists(os.path.join(local_repo_dir, ".git")):
-        await run_git_command(["git","init"], cwd=local_repo_dir)
-        await run_git_command(["git","remote","add","origin",remote_url], cwd=local_repo_dir)
-
-    await run_git_command(["git","fetch","origin"], cwd=local_repo_dir)
-    await run_git_command(["git","checkout","-B", GITHUB_BRANCH, f"origin/{GITHUB_BRANCH}"], cwd=local_repo_dir)
-    src = os.path.join(local_repo_dir, "database.db")
-    if os.path.exists(src):
-        shutil.copy2(src, local_db_path)
-        print("[RESTORE] database.db restored from GitHub backup")
-        load_data_into_memory()
-    else:
-        print("[RESTORE] No database.db found in GitHub backup")
-
-# ---------------------------
-# Periodic restore task (every 2 hours)
-# ---------------------------
-async def periodic_restore_from_github():
-    if not GH_TOKEN:
-        print("[RESTORE] GH_TOKEN not set; skipping periodic restore")
-        return
-
-    local_db_path = os.path.join(DATA_DIR, "database.db")
-    local_repo_dir = os.path.join(DATA_DIR, ".local_git")
-    os.makedirs(local_repo_dir, exist_ok=True)
-    if not os.path.exists(os.path.join(local_repo_dir, ".git")):
-        await run_git_command(["git","init"], cwd=local_repo_dir)
-        await run_git_command(["git","remote","add","origin",f"https://x-access-token:{GH_TOKEN}@github.com/mc250132689/identifyingspiritualsickness-chatbot-backend.git"], cwd=local_repo_dir)
-
-    while True:
-        restore_needed = False
-        if not os.path.exists(local_db_path):
-            restore_needed = True
-            print("[RESTORE] database.db missing locally, will restore from GitHub")
-        else:
-            try:
-                conn = sqlite3.connect(local_db_path)
-                c = conn.cursor()
-                c.execute("SELECT COUNT(*) FROM training_data")
-                count = c.fetchone()[0]
-                conn.close()
-                if count == 0:
-                    restore_needed = True
-                    print("[RESTORE] database.db empty, will restore from GitHub")
-            except Exception:
-                restore_needed = True
-                print("[RESTORE] database.db corrupted or inaccessible, will restore from GitHub")
-
-        if restore_needed:
-            try:
-                await run_git_command(["git","fetch","origin"], cwd=local_repo_dir)
-                await run_git_command(["git","checkout","-B", GITHUB_BRANCH, f"origin/{GITHUB_BRANCH}"], cwd=local_repo_dir)
-                src = os.path.join(local_repo_dir, "database.db")
-                if os.path.exists(src):
-                    shutil.copy2(src, local_db_path)
-                    print(f"[RESTORE] database.db restored from GitHub at {datetime.datetime.utcnow().isoformat()}")
-                    load_data_into_memory()
-            except Exception as e:
-                print("[RESTORE] periodic restore error:", e)
-
-        await asyncio.sleep(7200)  # every 2 hours
-
+    # push to postgres
+    pconn = get_db()
+    pcur = pconn.cursor()
+    count = 0
+    for r in rows:
+        q = r[1] or ""
+        a = r[2] or ""
+        lang = r[3] or "en"
+        hadith_refs = r[4] or None
+        pcur.execute(
+            "INSERT INTO training_data (question, answer, lang, hadith_refs) VALUES (%s, %s, %s, %s)",
+            (q, a, lang, hadith_refs)
+        )
+        count += 1
+    pconn.commit()
+    pcur.close()
+    pconn.close()
+    print(f"Migrated {count} rows from sqlite -> postgres")
 
 # ---------------------------
 # Startup hooks
 # ---------------------------
 @app.on_event("startup")
 async def startup_event():
-    if GH_TOKEN:
-        # Initial conditional restore
-        await auto_restore_from_github()
-        # Start periodic restore task
-        asyncio.create_task(periodic_restore_from_github())
+    # reload memory into in-memory cache
+    try:
+        load_data_into_memory()
+    except Exception as e:
+        print("[STARTUP] load_data_into_memory error:", e)
 
-    load_data_into_memory()
+    # optional keep-awake
     asyncio.create_task(keep_awake_task())
-    if GH_TOKEN:
-        asyncio.create_task(auto_backup_to_github())
-    print("[STARTUP] Completed startup tasks")
+    print("[STARTUP] Completed startup tasks (Postgres mode)")
+
+# If you want to run the migration locally:
+# Set DATABASE_URL (or DB_* env vars) locally then run:
+# python app.py --migrate-sqlite /path/to/data/database.db
+if __name__ == "__main__":
+    import sys
+    if "--migrate-sqlite" in sys.argv:
+        try:
+            idx = sys.argv.index("--migrate-sqlite")
+            sqlite_path = sys.argv[idx+1]
+            migrate_sqlite_to_postgres(sqlite_path)
+        except Exception as e:
+            print("Usage: python app.py --migrate-sqlite /path/to/database.db")
+            print("Error:", e)
