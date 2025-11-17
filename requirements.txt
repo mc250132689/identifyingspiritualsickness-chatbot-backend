@@ -7,4 +7,4 @@ python-multipart
 pydantic
 aiohttp
 aiofiles
-psycopg2
+psycopg2-binary
