@@ -1,4 +1,7 @@
-# app.py (Postgres / Neon ready)
+# app.py (Part 1 of 3) - Postgres-ready, upgraded sentiment/emotion (split into 3 parts)
+# ---------------------------
+# Imports & configuration
+# ---------------------------
 from fastapi import FastAPI, Query, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,6 +20,15 @@ import datetime
 import psycopg2
 import psycopg2.extras
 import sqlite3  # only used by the local migration helper
+
+# Optional heavy libs for local model inference - lazy import handled below
+try:
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import torch
+    import numpy as np
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    TRANSFORMERS_AVAILABLE = False
 
 # ---------------------------
 # Basic app + CORS
@@ -50,14 +62,37 @@ CHANNEL_BINDING = os.getenv("CHANNEL_BINDING")  # e.g. "require"
 SSLMODE = os.getenv("SSLMODE", "require")
 
 # ---------------------------
+# Models & mapping globals (lazy loaded)
+# ---------------------------
+# Preferred model names (can be changed later)
+MULTILINGUAL_SENT_MODEL = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
+EMOTION_MODEL = "j-hartmann/emotion-english-distilroberta-base"
+
+sent_tokenizer = None
+sent_model = None
+sent_labels = ["Negative", "Neutral", "Positive"]
+
+emo_tokenizer = None
+emo_model = None
+emo_labels = ['anger', 'disgust', 'fear', 'joy', 'neutral', 'sadness', 'surprise']
+
+islamic_map = {
+    "fear": "Khawf (anxiety / was-was / fear of harm)",
+    "sadness": "Huzn (sorrow / spiritual distress)",
+    "joy": "Farah (gratitude / relief / happiness)",
+    "anger": "Ghadab (anger / frustration)",
+    "disgust": "Karahah (repulsion / dislike)",
+    "surprise": "Tafakkur (reflection / amazement)",
+    "neutral": "Sakinah (calmness / stability)"
+}
+
+# ---------------------------
 # PostgreSQL helpers
 # ---------------------------
 def build_dsn_from_env():
     """Return a DSN string for psycopg2 from env vars, or DATABASE_URL if provided."""
     if DATABASE_URL:
-        # psycopg2 accepts the URL directly
         return DATABASE_URL
-    # Build a DSN; include sslmode and channel_binding if provided
     params = {
         "user": DB_USER,
         "password": DB_PASS,
@@ -72,7 +107,6 @@ def build_dsn_from_env():
     if SSLMODE:
         dsn_parts.append(f"sslmode={SSLMODE}")
     if CHANNEL_BINDING:
-        # psycopg2 supports channel_binding as a libpq param
         dsn_parts.append(f"channel_binding={CHANNEL_BINDING}")
     return " ".join(dsn_parts)
 
@@ -82,7 +116,6 @@ def get_db():
     Uses DATABASE_URL if provided, otherwise builds DSN from DB_* env vars.
     """
     dsn = build_dsn_from_env()
-    # psycopg2.connect accepts both a libpq-style DSN string and a URL
     conn = psycopg2.connect(dsn)
     return conn
 
@@ -111,7 +144,10 @@ def init_db():
     conn.close()
 
 # Attempt to create tables at start (idempotent)
-init_db()
+try:
+    init_db()
+except Exception as e:
+    print("[INIT_DB] error:", e)
 
 # ---------------------------
 # Utilities
@@ -147,6 +183,110 @@ async def hf_symptom_classify(text: str, model_id: str):
     except Exception:
         pass
     return "none", 0.0
+
+# ---------------------------
+# Sentiment/emotion lazy loader
+# ---------------------------
+def load_models_if_needed():
+    global sent_tokenizer, sent_model, emo_tokenizer, emo_model
+    if not TRANSFORMERS_AVAILABLE:
+        return False
+    try:
+        if sent_tokenizer is None or sent_model is None:
+            sent_tokenizer = AutoTokenizer.from_pretrained(MULTILINGUAL_SENT_MODEL)
+            sent_model = AutoModelForSequenceClassification.from_pretrained(MULTILINGUAL_SENT_MODEL)
+        if emo_tokenizer is None or emo_model is None:
+            emo_tokenizer = AutoTokenizer.from_pretrained(EMOTION_MODEL)
+            emo_model = AutoModelForSequenceClassification.from_pretrained(EMOTION_MODEL)
+        return True
+    except Exception as e:
+        print("[MODEL LOAD] error:", e)
+        return False
+
+async def hf_sentiment(text: str):
+    """
+    Upgraded multilingual sentiment + emotion + Islamic mapping
+    Returns a dict with sentiment, emotion, islamic_emotion, confidence
+    Falls back to HuggingFace InferenceClient if local transformers not available
+    """
+    if not text or text.strip() == "":
+        return {
+            "sentiment": "Neutral",
+            "emotion": "neutral",
+            "islamic_emotion": islamic_map.get("neutral"),
+            "confidence": 0.0
+        }
+
+    # Try local transformers first (if installed)
+    if TRANSFORMERS_AVAILABLE and load_models_if_needed():
+        try:
+            sent_inputs = sent_tokenizer(text, return_tensors="pt", truncation=True)
+            sent_outputs = sent_model(**sent_inputs)
+            sent_scores = torch.softmax(sent_outputs.logits, dim=1).detach().numpy()[0]
+            sent_idx = int(np.argmax(sent_scores))
+            sentiment = sent_labels[sent_idx]
+            sent_conf = float(sent_scores[sent_idx])
+
+            emo_inputs = emo_tokenizer(text, return_tensors="pt", truncation=True)
+            emo_outputs = emo_model(**emo_inputs)
+            emo_scores = torch.softmax(emo_outputs.logits, dim=1).detach().numpy()[0]
+            emo_idx = int(np.argmax(emo_scores))
+            emotion_raw = emo_labels[emo_idx]
+            islamic_emotion = islamic_map.get(emotion_raw, islamic_map.get("neutral"))
+
+            return {
+                "sentiment": sentiment,
+                "emotion": emotion_raw,
+                "islamic_emotion": islamic_emotion,
+                "confidence": round(sent_conf, 4)
+            }
+        except Exception as e:
+            print("[LOCAL SENT] error:", e)
+            # fall through to inference client
+
+    # Fallback to InferenceClient (if configured)
+    if client:
+        try:
+            sres = await asyncio.to_thread(lambda: client.text_classification(model=MULTILINGUAL_SENT_MODEL, inputs=text))
+            if isinstance(sres, list) and len(sres) > 0:
+                s_lbl = sres[0].get("label")
+                s_score = float(sres[0].get("score", 0.0))
+                lbl = str(s_lbl).lower()
+                if "neg" in lbl or "0" in lbl:
+                    sent = "Negative"
+                elif "neu" in lbl or "1" in lbl:
+                    sent = "Neutral"
+                else:
+                    sent = "Positive"
+            else:
+                sent = "Neutral"
+                s_score = 0.0
+
+            eres = await asyncio.to_thread(lambda: client.text_classification(model=EMOTION_MODEL, inputs=text))
+            if isinstance(eres, list) and len(eres) > 0:
+                e_lbl = str(eres[0].get("label", "neutral")).lower()
+                emotion_raw = e_lbl if e_lbl in emo_labels else ("neutral" if "neu" in e_lbl else e_lbl)
+            else:
+                emotion_raw = "neutral"
+
+            islamic_emotion = islamic_map.get(emotion_raw, islamic_map.get("neutral"))
+
+            return {
+                "sentiment": sent,
+                "emotion": emotion_raw,
+                "islamic_emotion": islamic_emotion,
+                "confidence": round(float(s_score), 4)
+            }
+        except Exception as e:
+            print("[HF INFERENCE] error:", e)
+
+    # last resort fallback
+    return {
+        "sentiment": "Neutral",
+        "emotion": "neutral",
+        "islamic_emotion": islamic_map.get("neutral"),
+        "confidence": 0.0
+    }
 
 # ---------------------------
 # Pydantic models
@@ -258,7 +398,8 @@ async def chat(req: ChatRequest):
                 ]
             )
             reply = completion.choices[0].message["content"]
-        except:
+        except Exception as e:
+            print("[CHAT FALLBACK] error:", e)
             reply = "Sorry, model backend currently unavailable. Please try later."
     else:
         reply = "Model client not configured on server."
@@ -280,6 +421,8 @@ async def chat(req: ChatRequest):
     trained_answers[lang][user_message.lower()] = {"answer": reply, "norm": normalize_text(user_message)}
 
     return {"response": reply, "hadith_refs": hadith_refs}
+
+# app.py (Part 2 of 3) - training, feedback, guidance, hadith-search, admin-stats
 
 # ---------------------------
 # Training endpoints
@@ -334,14 +477,49 @@ async def get_training_data():
         })
     return {"training_data": data}
 
+# ---------------------------
+# Feedback endpoints (with sentiment/emotion)
+# ---------------------------
 @app.post("/submit-feedback")
 async def submit_feedback(item: FeedbackItem):
+    # collect comment text (prefer explicit comments field; fallback to q14)
+    comment_text = (item.comments or "").strip()
+    if not comment_text:
+        # use q14 if present in object (some frontends send q14 as comments)
+        try:
+            # pydantic model doesn't include q12..q14 as attributes other than comments,
+            # but some payloads might include them; check raw dict via item.dict()
+            raw = item.dict()
+            comment_text = (raw.get("q14") or raw.get("comments") or "").strip()
+        except Exception:
+            comment_text = ""
+
+    # compute sentiment/emotion (async)
+    try:
+        sent_obj = await hf_sentiment(comment_text)
+    except Exception as e:
+        print("[SENTIMENT] error:", e)
+        sent_obj = {
+            "sentiment": "Neutral",
+            "emotion": "neutral",
+            "islamic_emotion": islamic_map.get("neutral"),
+            "confidence": 0.0
+        }
+
+    payload = item.dict()
+    # attach full sentiment/emotion info
+    payload["sentiment"] = sent_obj.get("sentiment")
+    payload["emotion"] = sent_obj.get("emotion")
+    payload["islamic_emotion"] = sent_obj.get("islamic_emotion")
+    payload["sentiment_confidence"] = sent_obj.get("confidence")
+
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("INSERT INTO feedback (data) VALUES (%s)", (json.dumps(item.dict()),))
+    cur.execute("INSERT INTO feedback (data) VALUES (%s)", (json.dumps(payload),))
     conn.commit()
     cur.close()
     conn.close()
+
     return {"message": "Feedback submitted. Jazakallah khair."}
 
 @app.get("/export-feedback")
@@ -354,11 +532,24 @@ async def export_feedback(key: str = Query(None)):
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    out = [r["data"] for r in rows]
+    out = []
+    for r in rows:
+        d = r["data"]
+        # data may be stored as JSON string or as JSON object depending on psycopg2/cfg
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except Exception:
+                try:
+                    # last resort: attempt eval (not ideal), but safer to keep original string
+                    d = {"raw": d}
+                except:
+                    d = {"raw": d}
+        out.append(d)
     return {"feedback": out}
 
 # ---------------------------
-# Guidance endpoint
+# Guidance endpoint (uses symptom classifier + heuristics)
 # ---------------------------
 @app.post("/guidance")
 async def guidance(req: GuidanceRequest):
@@ -366,7 +557,7 @@ async def guidance(req: GuidanceRequest):
     s = normalize_text(symptoms)
     label, score = "none", 0.0
     lang = "en"
-    if symptoms:
+    if symptoms and symptoms.strip():
         try:
             lang = detect(symptoms)
         except:
@@ -376,7 +567,7 @@ async def guidance(req: GuidanceRequest):
         label, score = await hf_symptom_classify(text_for_model, MODEL_ID)
 
     threshold = 0.6
-    if score < threshold or not symptoms:
+    if score < threshold or not symptoms.strip():
         keywords_jin = ["voices","hear voices","see","seeing","visions","speaking","possession","control me","not myself","sudden change"]
         keywords_sihir = ["sudden illness","sudden poverty","bad luck","marriage problem","family problem","sudden hatred","sudden fear"]
         keywords_ruqyah = ["insomnia","nightmares","sleepless","dizziness","palpitation","weird smell","itching","sudden pain"]
@@ -469,9 +660,34 @@ async def admin_stats(key: str = Query(...)):
     top_questions = [q for q,_ in q_counter.most_common(10)]
     recent = [dict(i) for i in data[-10:]] if total else []
 
+    # feedback stats
     cur.execute("SELECT * FROM feedback ORDER BY id ASC")
     fb = cur.fetchall()
     feedback_count = len(fb)
+
+    # sentiment and islamic emotion summary
+    sentiment_counts = Counter()
+    islamic_counts = Counter()
+    senti_examples = []
+    for row in fb:
+        d = row["data"]
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except:
+                d = {}
+        sent = d.get("sentiment") or d.get("sentiment_label") or "Neutral"
+        # normalize
+        sent_norm = sent.capitalize() if isinstance(sent, str) else "Neutral"
+        sentiment_counts[sent_norm] += 1
+
+        islamic = d.get("islamic_emotion") or d.get("islamic") or None
+        if islamic:
+            islamic_counts[islamic] += 1
+
+        if len(senti_examples) < 5:
+            senti_examples.append(d)
+
     cur.close()
     conn.close()
 
@@ -484,96 +700,126 @@ async def admin_stats(key: str = Query(...)):
         "hadith_examples": hadith_examples,
         "top_questions": top_questions,
         "recent_records": recent,
-        "feedback_count": feedback_count
+        "feedback_count": feedback_count,
+        "sentiment_summary": dict(sentiment_counts),
+        "islamic_emotion_summary": dict(islamic_counts),
+        "sentiment_examples": senti_examples
     }
 
-# ---------------------------
-# Health / Ping endpoints
-# ---------------------------
-@app.get("/ping")
-async def ping():
-    return {"status": "ok", "message": "Server is awake"}
+# app.py (Part 3 of 3) - utilities, HF helpers, normalization, Islamic emotion map, keep-alive
 
 # ---------------------------
-# Background tasks: keep-alive ping
+# Utilities
 # ---------------------------
-async def keep_awake_task():
-    session = aiohttp.ClientSession()
+def normalize_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z0-9\s]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def extract_hadith_refs(text: str):
+    # crude pattern for hadith references, customize as needed
+    pattern = r"(?:Hadith|Riwayat)\s*[0-9]+"
+    return re.findall(pattern, text)
+
+def get_db():
+    import psycopg2
+    import psycopg2.extras
+    conn = psycopg2.connect(DB_URL)
+    return conn
+
+# ---------------------------
+# Hugging Face helpers (async)
+# ---------------------------
+async def hf_sentiment(text: str):
+    # detect multilingual sentiment + islamic emotion
+    if not text.strip():
+        return {"sentiment":"Neutral","emotion":"neutral","islamic_emotion":"neutral","confidence":0.0}
     try:
-        while True:
-            try:
-                async with session.get(APP_URL, timeout=15) as r:
-                    print(f"[KEEP_ALIVE] ping {APP_URL} -> {r.status}")
-            except Exception as e:
-                print("[KEEP_ALIVE] error pinging APP_URL:", e)
-            await asyncio.sleep(180)  # 3 minutes
-    finally:
-        await session.close()
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        payload = {"inputs": text}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(HF_SENTIMENT_MODEL, headers=headers, json=payload) as resp:
+                r = await resp.json()
+        label = r[0]["label"] if isinstance(r, list) and "label" in r[0] else "Neutral"
+        score = float(r[0]["score"]) if isinstance(r, list) and "score" in r[0] else 0.0
+        # Map label to emotion
+        emotion = label.lower()
+        islamic_emotion = islamic_map.get(emotion, "neutral")
+        sentiment = "Positive" if emotion in ["joy","happy","satisfied"] else "Negative" if emotion in ["anger","fear","sad","disgust"] else "Neutral"
+        return {"sentiment":sentiment,"emotion":emotion,"islamic_emotion":islamic_emotion,"confidence":score}
+    except Exception as e:
+        print("[HF SENTIMENT] error:", e)
+        return {"sentiment":"Neutral","emotion":"neutral","islamic_emotion":"neutral","confidence":0.0}
+
+async def hf_symptom_classify(text: str, model_id: str):
+    # crude HF symptom classifier (jin, sihr, ruqyah)
+    if not text.strip():
+        return "none", 0.0
+    try:
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        payload = {"inputs": text}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"https://api-inference.huggingface.co/models/{model_id}", headers=headers, json=payload) as resp:
+                r = await resp.json()
+        # crude extraction
+        if isinstance(r, dict) and "label" in r and "score" in r:
+            return r["label"], float(r["score"])
+        return "none", 0.0
+    except Exception as e:
+        print("[HF SYMPTOM] error:", e)
+        return "none", 0.0
 
 # ---------------------------
-# Local migration helper (run manually, only if you have a local copy of the sqlite DB)
+# Islamic emotion mapping
 # ---------------------------
-def migrate_sqlite_to_postgres(sqlite_path: str):
-    """
-    One-shot helper to migrate your local SQLite database (data/database.db)
-    into the Postgres DB configured by env vars. Run this locally where your
-    sqlite file exists, with DATABASE_URL or DB_* env vars set.
-    """
-    if not os.path.exists(sqlite_path):
-        print("SQLite file not found:", sqlite_path)
-        return
-    # read sqlite data
-    sconn = sqlite3.connect(sqlite_path)
-    scur = sconn.cursor()
-    scur.execute("SELECT id, question, answer, lang, hadith_refs FROM training_data")
-    rows = scur.fetchall()
-    scur.close()
-    sconn.close()
-
-    # push to postgres
-    pconn = get_db()
-    pcur = pconn.cursor()
-    count = 0
-    for r in rows:
-        q = r[1] or ""
-        a = r[2] or ""
-        lang = r[3] or "en"
-        hadith_refs = r[4] or None
-        pcur.execute(
-            "INSERT INTO training_data (question, answer, lang, hadith_refs) VALUES (%s, %s, %s, %s)",
-            (q, a, lang, hadith_refs)
-        )
-        count += 1
-    pconn.commit()
-    pcur.close()
-    pconn.close()
-    print(f"Migrated {count} rows from sqlite -> postgres")
+islamic_map = {
+    "neutral": "Sakina",        # calm
+    "joy": "Farah",             # happiness
+    "happy": "Farah",
+    "satisfied": "Rida",        # contentment
+    "sad": "Huzn",              # sadness
+    "fear": "Khawf",            # fear
+    "anger": "Ghadab",          # anger
+    "disgust": "Qayr",          # displeasure
+    "surprise": "Taajjub"
+}
 
 # ---------------------------
-# Startup hooks
+# Startup and background tasks
 # ---------------------------
+async def keep_awake():
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.get(SERVER_URL)
+            print("[KEEP-AWAKE] pinged server successfully.")
+        except Exception as e:
+            print("[KEEP-AWAKE] failed:", e)
+        await asyncio.sleep(300)  # every 5 min
+
 @app.on_event("startup")
 async def startup_event():
-    # reload memory into in-memory cache
+    print("[STARTUP] server starting...")
+    asyncio.create_task(keep_awake())
+    # preload training data
     try:
-        load_data_into_memory()
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT question, answer, lang FROM training_data")
+        rows = cur.fetchall()
+        for q,a,l in rows:
+            if l not in trained_answers: trained_answers[l] = {}
+            trained_answers[l][q.lower()] = {"answer": a, "norm": normalize_text(q)}
+        cur.close()
+        conn.close()
+        print(f"[STARTUP] loaded {len(rows)} training records.")
     except Exception as e:
-        print("[STARTUP] load_data_into_memory error:", e)
+        print("[STARTUP] failed to load training data:", e)
 
-    # optional keep-awake
-    asyncio.create_task(keep_awake_task())
-    print("[STARTUP] Completed startup tasks (Postgres mode)")
-
-# If you want to run the migration locally:
-# Set DATABASE_URL (or DB_* env vars) locally then run:
-# python app.py --migrate-sqlite /path/to/data/database.db
+# ---------------------------
+# Main
+# ---------------------------
 if __name__ == "__main__":
-    import sys
-    if "--migrate-sqlite" in sys.argv:
-        try:
-            idx = sys.argv.index("--migrate-sqlite")
-            sqlite_path = sys.argv[idx+1]
-            migrate_sqlite_to_postgres(sqlite_path)
-        except Exception as e:
-            print("Usage: python app.py --migrate-sqlite /path/to/database.db")
-            print("Error:", e)
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
